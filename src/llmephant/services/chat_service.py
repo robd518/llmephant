@@ -1,0 +1,60 @@
+from fastapi.responses import JSONResponse, StreamingResponse
+from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMessage
+from llmephant.services.chat_runtime import run_chat_runtime
+from llmephant.core.logger import setup_logger
+import json
+
+logger = setup_logger(__name__)
+
+
+async def dispatch_chat_request(req: ChatRequest, raw_req):
+    """
+    Entry point for chat requests.
+    Delegates execution to the unified chat runtime (streaming + non-streaming).
+    """
+    user_id = raw_req.headers.get("x-user-id") or req.user or "user"
+    logger.info(f"Dispatching chat request for user_id={user_id}")
+
+    if getattr(req, "stream", False):
+        logger.info("Dispatching streaming chat request (runtime).")
+
+        async def sse_generator():
+            async for event in run_chat_runtime(req, user_id=user_id):
+                etype = event.get("type")
+                if etype == "chunk":
+                    yield f"data: {json.dumps(event['chunk'])}\n\n"
+                elif etype == "error":
+                    yield f"data: {json.dumps(event['payload'])}\n\n"
+                elif etype == "done":
+                    yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            sse_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+
+    logger.info("Dispatching non-streaming chat request (runtime).")
+
+    final_payload = None
+    async for event in run_chat_runtime(req, user_id=user_id):
+        etype = event.get("type")
+        if etype == "final":
+            final_payload = event.get("payload")
+        elif etype == "error":
+            final_payload = event.get("payload")
+
+    if final_payload is None:
+        err = ChatErrorMessage(
+            error=ErrorMessage(
+                type="runtime_error",
+                message="Chat runtime returned no payload.",
+                retryable=True,
+            )
+        )
+        final_payload = err.model_dump()
+
+    return JSONResponse(content=final_payload)
