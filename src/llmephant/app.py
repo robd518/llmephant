@@ -15,12 +15,12 @@ logger = setup_logger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        logger.info("🐘🚀 Starting up llmephant!")
         mcp = MCPToolProvider(
             name="Test MCP",
             url="http://macbook-pro.cinnebar-mamba.ts.net:8000/mcp",
-            tool_name_prefix="mcp__"
+            tool_name_prefix="test_mcp__"
         )
-        logger.info("🐘🚀 Starting up llmephant!")
         init_embedder()
         init_qdrant()
         app.state.registry = ToolRegistry()
@@ -29,9 +29,15 @@ async def lifespan(app: FastAPI):
         yield
         logger.info("🐘🛑 Shutting down.")
 
-    except RuntimeError as e:
-        logger.critical(f"FastAPI failed to start: {str(e)}")
-        raise RuntimeError(f"FastAPI failed to start: {str(e)}")
+        # Clean up provider resources if the provider exposes a close hook.
+        if hasattr(mcp, "aclose"):
+            await mcp.aclose()
+        elif hasattr(mcp, "close"):
+            mcp.close()
+
+    except Exception as e:
+        logger.exception("FastAPI failed to start")
+        raise
 
     finally:
         logger.info("Application stopped.")

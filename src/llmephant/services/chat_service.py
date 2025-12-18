@@ -1,13 +1,14 @@
+from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMessage
-from llmephant.services.chat_runtime import run_chat_runtime
+from llmephant.services.chat_runtime import run_chat_runtime, run_chat_runtime_stream
 from llmephant.core.logger import setup_logger
 import json
 
 logger = setup_logger(__name__)
 
 
-async def dispatch_chat_request(req: ChatRequest, raw_req):
+async def dispatch_chat_request(req: ChatRequest, raw_req: Request):
     """
     Entry point for chat requests.
     Delegates execution to the unified chat runtime (streaming + non-streaming).
@@ -19,10 +20,16 @@ async def dispatch_chat_request(req: ChatRequest, raw_req):
         logger.info("Dispatching streaming chat request (runtime).")
 
         async def sse_generator():
-            async for event in run_chat_runtime(req, user_id=user_id):
+            async for event in run_chat_runtime_stream(req, user_id=user_id, request=raw_req):
                 etype = event.get("type")
-                if etype == "chunk":
-                    yield f"data: {json.dumps(event['chunk'])}\n\n"
+
+                # Forward only streamed output to the client.
+                if etype in ("chunk", "token"):
+                    if "chunk" in event:
+                        yield f"data: {json.dumps(event['chunk'])}\n\n"
+                    elif "text" in event:
+                        # Fallback: wrap raw token text in a minimal OpenAI-style chunk.
+                        yield f"data: {json.dumps({'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': {'content': event['text']}, 'finish_reason': None}]})}\n\n"
                 elif etype == "error":
                     yield f"data: {json.dumps(event['payload'])}\n\n"
                 elif etype == "done":
@@ -34,13 +41,14 @@ async def dispatch_chat_request(req: ChatRequest, raw_req):
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
             },
         )
 
     logger.info("Dispatching non-streaming chat request (runtime).")
 
     final_payload = None
-    async for event in run_chat_runtime(req, user_id=user_id):
+    async for event in run_chat_runtime(req, user_id=user_id, request=raw_req):
         etype = event.get("type")
         if etype == "final":
             final_payload = event.get("payload")

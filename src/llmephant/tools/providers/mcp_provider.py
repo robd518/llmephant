@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 import itertools
 from dataclasses import dataclass
@@ -58,6 +59,8 @@ class MCPToolProvider:
         self._initialized_session_id: Optional[str] = None
         self._timeout_s = timeout_s
         self._ids = itertools.count(1)
+        # Optional persistent client (not currently used); kept for future reuse and clean shutdown.
+        self._client: Optional[httpx.AsyncClient] = None
         self.tool_name_prefix = tool_name_prefix or f"{self.name}__"
         self.allow_tools = allow_tools
         self.deny_tools = deny_tools
@@ -313,3 +316,28 @@ class MCPToolProvider:
             raw=result,
             is_error=bool(result.get("isError", False)),
         )
+
+
+    async def aclose(self) -> None:
+        """Release any resources held by this provider.
+
+        Note: The current implementation creates an AsyncClient per call (via `async with`),
+        so there is typically nothing to close. This hook exists so the FastAPI lifespan
+        can always safely call `await provider.aclose()`.
+        """
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def close(self) -> None:
+        """Best-effort synchronous close.
+
+        If called while an event loop is running, schedules `aclose()`.
+        """
+        if self._client is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.aclose())
