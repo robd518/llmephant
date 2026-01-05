@@ -13,6 +13,20 @@ async def dispatch_chat_request(req: ChatRequest, raw_req: Request):
     Entry point for chat requests.
     Delegates execution to the unified chat runtime (streaming + non-streaming).
     """
+
+    # Immediately fail if app.state.executor or app.state.registry is not set up.
+    missing = [k for k in ("registry", "executor") if getattr(raw_req.app.state, k, None) is None]
+    if missing:
+        err = ChatErrorMessage(
+            error=ErrorMessage(
+                type="server_error",
+                message=f"Service unavailable: tooling not initialized (missing: {', '.join(missing)}).",
+                retryable=True,
+            )
+        )
+        logger.error("Tooling not initialized on app.state. Missing=%s state_keys=%s", missing, list(vars(raw_req.app.state).keys()))
+        return JSONResponse(content=err.model_dump(), status_code=503)
+
     user_id = raw_req.headers.get("x-user-id") or req.user or "user"
     logger.info(f"Dispatching chat request for user_id={user_id}")
 

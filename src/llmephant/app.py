@@ -11,7 +11,6 @@ from llmephant.tools.providers.mcp_provider import MCPToolProvider
 logger = setup_logger(__name__)
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -23,9 +22,22 @@ async def lifespan(app: FastAPI):
         )
         init_embedder()
         init_qdrant()
+
+        # Tooling is optional per-turn: always create the registry/executor,
+        # but treat MCP import failures as a degraded mode (no tools).
         app.state.registry = ToolRegistry()
-        await import_mcp_tools(app.state.registry, mcp)
         app.state.executor = ToolExecutor(app.state.registry)
+        app.state.tools_enabled = False
+        app.state.tooling_init_error = None
+
+        try:
+            await import_mcp_tools(app.state.registry, mcp)
+            app.state.tools_enabled = True
+            logger.info("✅ Tooling initialized (%d tools)", len(app.state.registry.openai_tools()))
+        except Exception as e:
+            app.state.tooling_init_error = str(e)
+            logger.exception("⚠️ Tooling initialization failed; continuing without tools")
+
         yield
         logger.info("🐘🛑 Shutting down.")
 

@@ -7,7 +7,7 @@ from fastapi import Request
 from llmephant.core.logger import setup_logger
 from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMessage
 from llmephant.models.chat_model import ChatMessage
-from llmephant.models.tool_model import ToolCall
+from llmephant.tools.executor import ToolResult
 from llmephant.services.memory_service import (
     augment_messages_with_memory,
     extract_and_store_memory,
@@ -17,7 +17,52 @@ from llmephant.services.memory_service import (
 from llmephant.services.upstream_llm import chat_upstream, chat_upstream_stream
 from llmephant.utils.text import get_last_user_message
 
+
 logger = setup_logger(__name__)
+
+
+def _require_tooling(request: Request):
+    """Return (registry, executor) from app-scoped state or raise a diagnostic error."""
+    state = request.app.state
+    registry = getattr(state, "registry", None)
+    executor = getattr(state, "executor", None)
+
+    if registry is None or executor is None:
+        # Starlette/FastAPI State stores attributes on __dict__.
+        present_keys = []
+        try:
+            present_keys = sorted(list(getattr(state, "__dict__", {}).keys()))
+        except Exception:
+            present_keys = []
+
+        missing = []
+        if registry is None:
+            missing.append("registry")
+        if executor is None:
+            missing.append("executor")
+
+        raise RuntimeError(
+            "Tooling not initialized on FastAPI app state. "
+            f"Missing: {', '.join(missing)}. "
+            f"Present state keys: {present_keys}. "
+            "This usually means the FastAPI lifespan/startup hook did not run or failed. "
+            "Ensure startup sets request.app.state.registry and request.app.state.executor before handling requests."
+        )
+
+    return registry, executor
+
+
+def _tool_result_to_content(tool_result: ToolResult) -> str:
+    """Serialize ToolResult into the string content expected for tool messages."""
+    if tool_result.is_error:
+        msg = tool_result.error or "Tool execution failed"
+        return json.dumps({"error": msg}, ensure_ascii=False)
+
+    val = tool_result.result
+    if isinstance(val, str):
+        return val
+
+    return json.dumps(val, ensure_ascii=False)
 
 
 # Runtime emits events that the transport layer can adapt to HTTP/SSE.
@@ -178,22 +223,14 @@ async def run_chat_runtime_stream(
         return
 
     # Tooling is created once at app startup (FastAPI lifespan) and stored on the FastAPI app state.
-    state = request.app.state
-    registry = getattr(state, "registry", None)
-    executor = getattr(state, "executor", None)
+    registry, executor = _require_tooling(request)
 
-    if registry is None:
-        raise RuntimeError(
-            "ToolRegistry not initialized. Ensure FastAPI lifespan sets request.app.state.registry before handling requests."
-        )
-    if executor is None:
-        raise RuntimeError(
-            "ToolExecutor not initialized. Ensure FastAPI lifespan sets request.app.state.executor before handling requests."
-        )
+    # Tools are optional per-turn: only advertise tools when tooling is enabled.
+    tools_enabled = bool(getattr(request.app.state, "tools_enabled", False))
+    openai_tools = registry.openai_tools() if tools_enabled else []
 
-    # Advertise tools to the upstream LLM (OpenAI tool schema)
-    req.tools = registry.openai_tools()
-    req.tool_choice = "auto"
+    req.tools = openai_tools or None
+    req.tool_choice = "auto" if openai_tools else None
 
     # We allow a small number of tool iterations to avoid infinite loops.
     max_tool_iterations = 5
@@ -273,20 +310,21 @@ async def run_chat_runtime_stream(
             assembled_summary = []
             for tc in tool_calls_raw:
                 fn = tc.get("function") or {}
+                args_preview_src = fn.get("arguments") or ""
+                preview = args_preview_src[:60] if isinstance(args_preview_src, str) else str(args_preview_src)[:60]
+                if isinstance(preview, str):
+                    preview = preview.replace("\n", "\\n").replace("\r", "\\r")
 
-            args = fn.get("arguments") or ""
-            preview = args[:60] if isinstance(args, str) else str(args)[:60]
-            if isinstance(preview, str):
-                preview = preview.replace("\n", "\\n").replace("\r", "\\r")
-
-            assembled_summary.append(
-                {
-                    "name": fn.get("name"),
-                    "args_len": len(args) if isinstance(args, str) else len(str(args)),
-                    "has_id": bool(tc.get("id")),
-                    "args_preview": repr(preview),
-                }
-            )
+                assembled_summary.append(
+                    {
+                        "name": fn.get("name"),
+                        "args_len": len(args_preview_src)
+                        if isinstance(args_preview_src, str)
+                        else len(str(args_preview_src)),
+                        "has_id": bool(tc.get("id")),
+                        "args_preview": repr(preview),
+                    }
+                )
             logger.info(f"[tool-stream] assembled tool_calls (iteration={iteration}): {assembled_summary}")
 
             # Ensure each tool call has an id for tool responses.
@@ -321,27 +359,19 @@ async def run_chat_runtime_stream(
                     )
                     args = {}
 
-                call = ToolCall(name=name, arguments=args, call_id=call_id, raw=tc)
-
-                # Backward-compatible execution: support either executor.execute(call)
-                # or executor.execute(name, args) depending on implementation.
                 try:
-                    tool_result = await executor.execute(call)
-                except TypeError:
-                    tool_result = await executor.execute(call.name, call.arguments)
-
-                is_error = bool(tool_result.get("is_error"))
-                error_msg = tool_result.get("error") or "Tool execution failed"
-                result_val = tool_result.get("result")
+                    tool_result = await executor.execute(name, args)
+                except Exception as e:
+                    logger.exception(
+                        f"[tool-stream] tool execution raised (iteration={iteration}) name={name} call_id={call_id}"
+                    )
+                    tool_result = ToolResult(result=None, is_error=True, error=str(e), raw=None)
 
                 logger.info(
-                    f"[tool-stream] tool complete (iteration={iteration}) name={name} call_id={call_id} is_error={is_error} result_type={type(result_val).__name__}"
+                    f"[tool-stream] tool complete (iteration={iteration}) name={name} call_id={call_id} is_error={tool_result.is_error} result_type={type(tool_result.result).__name__}"
                 )
 
-                if is_error:
-                    content = json.dumps({"error": error_msg}, ensure_ascii=False)
-                else:
-                    content = result_val if isinstance(result_val, str) else json.dumps(result_val, ensure_ascii=False)
+                content = _tool_result_to_content(tool_result)
 
                 req.messages.append(
                     ChatMessage(
@@ -434,26 +464,14 @@ async def run_chat_runtime(
         yield {"type": "done"}
         return
 
-    # Tooling is created once at app startup (FastAPI lifespan) and stored on the FastAPI app state.
-    # `request` is required to avoid circular imports and to ensure app-scoped state is the single source of truth.
-    state = request.app.state
+    registry, executor = _require_tooling(request)
 
-    registry = getattr(state, "registry", None)
-    executor = getattr(state, "executor", None)
+    # Tools are optional per-turn: only advertise tools when tooling is enabled.
+    tools_enabled = bool(getattr(request.app.state, "tools_enabled", False))
+    openai_tools = registry.openai_tools() if tools_enabled else []
 
-    if registry is None:
-        raise RuntimeError(
-            "ToolRegistry not initialized. Ensure FastAPI lifespan sets request.app.state.registry before handling requests."
-        )
-
-    if executor is None:
-        raise RuntimeError(
-            "ToolExecutor not initialized. Ensure FastAPI lifespan sets request.app.state.executor before handling requests."
-        )
-
-    # Advertise tools to the upstream LLM (OpenAI tool schema)
-    req.tools = registry.openai_tools()
-    req.tool_choice = "auto"
+    req.tools = openai_tools or None
+    req.tool_choice = "auto" if openai_tools else None
 
     # We allow a small number of tool iterations to avoid infinite loops.
     max_tool_iterations = 5
@@ -545,23 +563,14 @@ async def run_chat_runtime(
                 except Exception:
                     args = {}
 
-                call = ToolCall(name=name, arguments=args, call_id=call_id, raw=tc)
-                # Support either executor.execute(call) or executor.execute(name, args) depending on implementation.
                 try:
-                    tool_result = await executor.execute(call)
-                except TypeError:
-                    tool_result = await executor.execute(call.name, call.arguments)
+                    tool_result = await executor.execute(name, args)
+                except Exception as e:
+                    logger.exception(f"Tool execution raised name={name} call_id={call_id}")
+                    tool_result = ToolResult(result=None, is_error=True, error=str(e), raw=None)
 
                 # Append tool message for the model to consume
-                is_error = bool(tool_result.get("is_error"))
-                error_msg = tool_result.get("error") or "Tool execution failed"
-                result_val = tool_result.get("result")
-
-                if is_error:
-                    content = json.dumps({"error": error_msg}, ensure_ascii=False)
-                else:
-                    # Avoid double-encoding strings (json.dumps("hi") -> '"hi"')
-                    content = result_val if isinstance(result_val, str) else json.dumps(result_val, ensure_ascii=False)
+                content = _tool_result_to_content(tool_result)
 
                 req.messages.append(
                     ChatMessage(

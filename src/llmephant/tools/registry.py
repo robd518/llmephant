@@ -52,8 +52,7 @@ async def import_mcp_tools(registry: ToolRegistry, mcp_provider) -> None:
     tools = await mcp_provider.list_tools()
 
     for t in tools:
-        # Expose to the LLM using a stable prefixed name
-        llm_name = mcp_provider._full_name(t.name)  # or a public helper if you prefer
+        llm_name = mcp_provider._full_name(t.name)
 
         registry.register_tool(
             RegisteredTool(
