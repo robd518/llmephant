@@ -341,3 +341,177 @@ def test_require_tooling_passes_when_both_present():
 
     req = _make_request_with_state(registry=object(), executor=object())
     _require_tooling(req)
+
+
+
+# ----------------------------
+# Item 3: tool advertisement gating (no tools/tool_choice when disabled)
+# ----------------------------
+
+
+def _import_chat_runtime_runners():
+    candidates = [
+        "llmephant.services.chat_runtime",
+        "llmephant.service.chat_runtime",
+    ]
+
+    last_err: Optional[Exception] = None
+    for mod_name in candidates:
+        try:
+            mod = __import__(mod_name, fromlist=["run_chat_runtime", "run_chat_runtime_stream"])
+            return mod, getattr(mod, "run_chat_runtime"), getattr(mod, "run_chat_runtime_stream")
+        except Exception as e:
+            last_err = e
+
+    raise ImportError(f"Could not import chat_runtime runners: {last_err}")
+
+
+
+# Inserted dataclasses for object-based mock returns
+
+
+@dataclass
+class _Msg:
+    role: str
+    content: str
+
+
+@dataclass
+class _UpstreamChoice:
+    message: _Msg
+
+
+@dataclass
+class _UpstreamResp:
+    choices: list[_UpstreamChoice]
+
+
+@dataclass
+class _DummyChatReq:
+    model: str = "test-model"
+    messages: Any = None
+    temperature: Optional[float] = 0.0
+    top_p: Optional[float] = 1.0
+    max_tokens: Optional[int] = 16
+    tools: Any = None
+    tool_choice: Any = None
+
+    def __post_init__(self):
+        if self.messages is None:
+            self.messages = [_Msg(role="user", content="hi")]
+
+
+class _StubRegistry:
+    def __init__(self, tools: Optional[list] = None):
+        self._tools = tools or []
+
+    def openai_tools(self):
+        return list(self._tools)
+
+
+@pytest.mark.asyncio
+async def test_tools_disabled_omits_tools_and_tool_choice_non_streaming(monkeypatch):
+    mod, run_chat_runtime, _run_chat_runtime_stream = _import_chat_runtime_runners()
+
+    captured: Dict[str, Any] = {}
+
+    class CapturingChatRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def fake_chat_upstream(chat_req):
+        captured["kwargs"] = getattr(chat_req, "kwargs", {})
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": "ok"}}
+            ]
+        }
+
+    monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
+    monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)
+    monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
+
+    request = _make_request_with_state(
+        registry=_StubRegistry(tools=[{"type": "function", "function": {"name": "x"}}]),
+        executor=object(),
+        tools_enabled=False,
+    )
+    req = _DummyChatReq()
+
+    async for event in run_chat_runtime(req, user_id="test-user", request=request):
+        if event.get("type") == "done":
+            break
+
+    assert "tools" not in captured.get("kwargs", {})
+    assert "tool_choice" not in captured.get("kwargs", {})
+
+
+@pytest.mark.asyncio
+async def test_tools_disabled_omits_tools_and_tool_choice_streaming(monkeypatch):
+    mod, _run_chat_runtime, run_chat_runtime_stream = _import_chat_runtime_runners()
+
+    captured: Dict[str, Any] = {}
+
+    class CapturingChatRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def fake_chat_upstream_stream(chat_req):
+        captured["kwargs"] = getattr(chat_req, "kwargs", {})
+        # One content chunk; no tool deltas.
+        yield {"choices": [{"delta": {"content": "ok"}}]}
+
+    monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
+    monkeypatch.setattr(mod, "chat_upstream_stream", fake_chat_upstream_stream)
+    monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
+
+    request = _make_request_with_state(
+        registry=_StubRegistry(tools=[{"type": "function", "function": {"name": "x"}}]),
+        executor=object(),
+        tools_enabled=False,
+    )
+    req = _DummyChatReq()
+
+    async for event in run_chat_runtime_stream(req, user_id="test-user", request=request):
+        if event.get("type") == "done":
+            break
+
+    assert "tools" not in captured.get("kwargs", {})
+    assert "tool_choice" not in captured.get("kwargs", {})
+
+
+@pytest.mark.asyncio
+async def test_tools_enabled_but_empty_list_omits_tools_and_tool_choice(monkeypatch):
+    mod, run_chat_runtime, _run_chat_runtime_stream = _import_chat_runtime_runners()
+
+    captured: Dict[str, Any] = {}
+
+    class CapturingChatRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def fake_chat_upstream(chat_req):
+        captured["kwargs"] = getattr(chat_req, "kwargs", {})
+        return {
+            "choices": [
+                {"message": {"role": "assistant", "content": "ok"}}
+            ]
+        }
+
+    monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
+    monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)
+    monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
+
+    request = _make_request_with_state(
+        registry=_StubRegistry(tools=[]),
+        executor=object(),
+        tools_enabled=True,
+    )
+    req = _DummyChatReq()
+
+    async for event in run_chat_runtime(req, user_id="test-user", request=request):
+        if event.get("type") == "done":
+            break
+
+    assert "tools" not in captured.get("kwargs", {})
+    assert "tool_choice" not in captured.get("kwargs", {})

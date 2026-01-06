@@ -225,12 +225,15 @@ async def run_chat_runtime_stream(
     # Tooling is created once at app startup (FastAPI lifespan) and stored on the FastAPI app state.
     registry, executor = _require_tooling(request)
 
-    # Tools are optional per-turn: only advertise tools when tooling is enabled.
+    # Tools are optional per-turn: only advertise tools when tooling is enabled AND we have tools.
     tools_enabled = bool(getattr(request.app.state, "tools_enabled", False))
     openai_tools = registry.openai_tools() if tools_enabled else []
+    advertise_tools = bool(openai_tools)
 
-    req.tools = openai_tools or None
-    req.tool_choice = "auto" if openai_tools else None
+    # Keep these on the request for debugging/visibility, but DO NOT rely on passing None to upstream.
+    # Some upstream adapters may serialize None/null fields; we want the keys omitted entirely.
+    req.tools = openai_tools if advertise_tools else None
+    req.tool_choice = "auto" if advertise_tools else None
 
     # We allow a small number of tool iterations to avoid infinite loops.
     max_tool_iterations = 5
@@ -245,19 +248,19 @@ async def run_chat_runtime_stream(
         saw_tool_calls = False
 
         try:
-            async for chunk in chat_upstream_stream(
-                ChatRequest(
-                    model=req.model,
-                    messages=req.messages,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    max_tokens=req.max_tokens,
-                    user=user_id,
-                    tools=req.tools,
-                    tool_choice=req.tool_choice,
-                    stream=True,
-                )
-            ):
+            upstream_kwargs: Dict[str, Any] = dict(
+                model=req.model,
+                messages=req.messages,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_tokens=req.max_tokens,
+                user=user_id,
+                stream=True,
+            )
+            if advertise_tools:
+                upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
+
+            async for chunk in chat_upstream_stream(ChatRequest(**upstream_kwargs)):
                 choice0 = (chunk.get("choices") or [{}])[0] or {}
                 delta = choice0.get("delta") or {}
 
@@ -466,12 +469,15 @@ async def run_chat_runtime(
 
     registry, executor = _require_tooling(request)
 
-    # Tools are optional per-turn: only advertise tools when tooling is enabled.
+    # Tools are optional per-turn: only advertise tools when tooling is enabled AND we have tools.
     tools_enabled = bool(getattr(request.app.state, "tools_enabled", False))
     openai_tools = registry.openai_tools() if tools_enabled else []
+    advertise_tools = bool(openai_tools)
 
-    req.tools = openai_tools or None
-    req.tool_choice = "auto" if openai_tools else None
+    # Keep these on the request for debugging/visibility, but DO NOT rely on passing None to upstream.
+    # Some upstream adapters may serialize None/null fields; we want the keys omitted entirely.
+    req.tools = openai_tools if advertise_tools else None
+    req.tool_choice = "auto" if advertise_tools else None
 
     # We allow a small number of tool iterations to avoid infinite loops.
     max_tool_iterations = 5
@@ -480,19 +486,19 @@ async def run_chat_runtime(
     while True:
         iteration += 1
         try:
-            upstream_resp = await chat_upstream(
-                ChatRequest(
-                    model=req.model,
-                    messages=req.messages,
-                    temperature=req.temperature,
-                    top_p=req.top_p,
-                    max_tokens=req.max_tokens,
-                    user=user_id,
-                    tools=req.tools,
-                    tool_choice=req.tool_choice,
-                    stream=False,
-                )
+            upstream_kwargs: Dict[str, Any] = dict(
+                model=req.model,
+                messages=req.messages,
+                temperature=req.temperature,
+                top_p=req.top_p,
+                max_tokens=req.max_tokens,
+                user=user_id,
+                stream=False,
             )
+            if advertise_tools:
+                upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
+
+            upstream_resp = await chat_upstream(ChatRequest(**upstream_kwargs))
         except Exception as e:
             logger.exception("Non-streaming upstream failed (runtime)")
             err = ChatErrorMessage(
