@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from typing import Any, AsyncIterator, Dict, List
-
 import json
 from fastapi import Request
 from llmephant.core.logger import setup_logger
@@ -63,6 +61,7 @@ def _tool_result_to_content(tool_result: ToolResult) -> str:
         return val
 
     return json.dumps(val, ensure_ascii=False)
+
 
 
 # Runtime emits events that the transport layer can adapt to HTTP/SSE.
@@ -296,6 +295,7 @@ async def run_chat_runtime_stream(
 
         # If tool calls were requested, execute them and restart streaming.
         if saw_tool_calls and tool_calls_acc:
+
             if iteration > max_tool_iterations:
                 err = ChatErrorMessage(
                     error=ErrorMessage(

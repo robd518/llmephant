@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, APIRouter
 from llmephant.core.logger import setup_logger
-from llmephant.routers import chat_router, memory_router, models_router
+from llmephant.routers import chat_router, memory_router, models_router, health_router
 from llmephant.services.embedding_service import init_embedder
 from llmephant.repositories.qdrant_repository import init_qdrant
 from llmephant.tools.registry import ToolRegistry, import_mcp_tools
@@ -56,11 +56,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LLMephant Memory API", lifespan=lifespan)
+router = APIRouter(prefix="/api/v1")
 
-app.include_router(chat_router.router, prefix="/v1")
-app.include_router(memory_router.router, prefix="/v1/memory")
-app.include_router(models_router.router, prefix="/v1")
+router.include_router(chat_router.router, prefix="/chat")
+router.include_router(memory_router.router, prefix="/memory")
+router.include_router(models_router.router, prefix="/models")
+router.include_router(health_router.router, prefix="/health")
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "llmephant-memory-api"}
+app.include_router(router)
