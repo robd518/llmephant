@@ -4,6 +4,7 @@ class Settings(BaseSettings):
     API_HOST: str
     API_PORT: str
     API_HOT_RELOAD: str
+    TOOLING_CONFIG_FILE: str
     UPSTREAM_OPENAI_BASE: str
     UPSTREAM_OPENAI_API_KEY: str
     QDRANT_URL: str
