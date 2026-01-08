@@ -39,6 +39,7 @@ services:
     command: [ "uvicorn", "llmephant.app:app", "--host", "0.0.0.0", "--port", "8080", "--reload" ]
     volumes:
       - ./src:/app/src
+      - ./tooling_config.yml:/app/tooling_config.yml:ro
 
 volumes:
   llmephant_qdrant:
