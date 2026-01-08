@@ -3,8 +3,11 @@ import asyncio
 import json
 import itertools
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
+from llmephant.core.logger import setup_logger
+
+logger = setup_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,150 @@ class MCPToolProvider:
     def _full_name(self, provider_tool_name: str) -> str:
         return f"{self.tool_name_prefix}{provider_tool_name}"
 
+    def _req_auth_diag(self, r: httpx.Response) -> tuple[list[str], bool, Optional[str]]:
+        """Return (header_keys, has_auth, auth_scheme) without leaking secret values."""
+        req = r.request
+        req_hdrs = dict(req.headers) if req is not None else {}
+        header_keys = sorted(list(req_hdrs.keys()))
+        auth_val = req_hdrs.get("authorization") or req_hdrs.get("Authorization")
+        has_auth = auth_val is not None and str(auth_val).strip() != ""
+        auth_scheme: Optional[str] = None
+        if has_auth:
+            try:
+                auth_scheme = str(auth_val).split()[0]
+            except Exception:
+                auth_scheme = "<unparseable>"
+        return header_keys, has_auth, auth_scheme
+
+    def _extract_error_message(self, r: httpx.Response) -> str:
+        """Best-effort extraction of an error message from JSON/SSE/plain responses."""
+        msg = ""
+        try:
+            ct = (r.headers.get("content-type") or "").lower()
+            if "text/event-stream" in ct:
+                data_lines: List[str] = []
+                for line in (r.text or "").splitlines():
+                    if line.startswith("data:"):
+                        data_lines.append(line[len("data:"):].strip())
+                data = json.loads(data_lines[-1]) if data_lines else None
+            else:
+                data = r.json()
+            if isinstance(data, dict) and "error" in data:
+                msg = (data.get("error") or {}).get("message") or ""
+        except Exception:
+            pass
+
+        if not msg:
+            try:
+                msg = r.text or ""
+            except Exception:
+                msg = ""
+        return msg
+
+    def _is_session_problem(self, msg: str) -> bool:
+        m = (msg or "").lower()
+        return (
+            "missing session id" in m
+            or "no valid session id" in m
+            or "invalid session" in m
+        )
+
+    def _capture_session_from_response(self, r: httpx.Response) -> None:
+        """Capture/refresh the MCP session id from any response.
+
+        IMPORTANT: We do NOT persist the session id into base headers (`self._headers`).
+        We attach it per request from `self._session_id` to avoid sticky stale sessions.
+        """
+        sid = r.headers.get("mcp-session-id")
+        if sid and sid != self._session_id:
+            self._session_id = sid
+            # New/changed session => must re-run initialization handshake.
+            self._initialized = False
+            self._initialized_session_id = None
+
+    def _log_request_diag(self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]) -> None:
+        """Lightweight request diagnostics (debug only; never logs secrets)."""
+        try:
+            req = r.request
+            header_keys, has_auth, auth_scheme = self._req_auth_diag(r)
+            logger.debug(
+                "MCP %s sent method=%s url=%s jsonrpc_id=%s status=%s has_session=%s initialized=%s header_keys=%s has_auth=%s auth_scheme=%s",
+                kind,
+                method,
+                str(req.url) if req is not None else "<no-request>",
+                payload_id,
+                r.status_code,
+                bool(self._session_id),
+                bool(self._initialized),
+                header_keys,
+                has_auth,
+                auth_scheme,
+            )
+        except Exception:
+            pass
+
+    def _log_http_error_diag(self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]) -> None:
+        """HTTP error diagnostics (error level; never logs secrets)."""
+        try:
+            req = r.request
+            header_keys, has_auth, auth_scheme = self._req_auth_diag(r)
+            ct = (r.headers.get("content-type") or "").lower()
+            try:
+                body_preview = (r.text or "")[:1200]
+            except Exception:
+                body_preview = "<unavailable>"
+
+            logger.error(
+                "MCP %s HTTP error status=%s url=%s rpc_method=%s jsonrpc_id=%s content_type=%s header_keys=%s has_auth=%s auth_scheme=%s has_session=%s initialized=%s body_preview=%r",
+                kind,
+                r.status_code,
+                str(req.url) if req is not None else "<no-request>",
+                method,
+                payload_id,
+                ct,
+                header_keys,
+                has_auth,
+                auth_scheme,
+                bool(self._session_id),
+                bool(self._initialized),
+                body_preview,
+            )
+        except Exception:
+            logger.exception("Failed to log MCP %s HTTP error diagnostics", kind)
+
+    async def _maybe_recover_session(
+        self,
+        *,
+        client: httpx.AsyncClient,
+        kind: str,
+        method: str,
+        payload_id: Optional[int],
+        do_post: Callable[[], Awaitable[httpx.Response]],
+        r: httpx.Response,
+    ) -> httpx.Response:
+        """Recover from missing/invalid session errors by resetting state and retrying once."""
+        if r.status_code != 400:
+            return r
+
+        sid = r.headers.get("mcp-session-id")
+        msg = self._extract_error_message(r)
+
+        if not self._is_session_problem(msg):
+            return r
+
+        logger.info("MCP session problem (%s): %r; resetting session and re-initializing", kind, msg[:200])
+
+        # Use new session id if server provided it; otherwise clear it.
+        self._session_id = sid
+        self._initialized = False
+        self._initialized_session_id = None
+
+        # For non-handshake methods, redo handshake then retry once.
+        if method not in ("initialize", "notifications/initialized"):
+            await self._ensure_initialized(client)
+
+        return await do_post()
+
     async def _rpc(self, client: httpx.AsyncClient, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         req_id = next(self._ids)
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
@@ -83,113 +230,20 @@ class MCPToolProvider:
 
         r = await do_post()
 
-        # Handle servers that require a session id and provide it on first failure.
-        if r.status_code == 400:
-            sid = r.headers.get("mcp-session-id")
-            try:
-                ct_400 = (r.headers.get("content-type") or "").lower()
-                if "text/event-stream" in ct_400:
-                    data_lines_400: List[str] = []
-                    for line in r.text.splitlines():
-                        if line.startswith("data:"):
-                            data_lines_400.append(line[len("data:"):].strip())
-                    data_400 = json.loads(data_lines_400[-1]) if data_lines_400 else None
-                else:
-                    data_400 = r.json()
-            except Exception:
-                data_400 = None
+        self._log_request_diag(r, kind="RPC", method=method, payload_id=req_id)
 
-            missing_session = False
-            if isinstance(data_400, dict) and "error" in data_400:
-                msg = (data_400.get("error") or {}).get("message") or ""
-                if "Missing session ID" in msg:
-                    missing_session = True
+        # Recover if server reports missing/invalid session.
+        r = await self._maybe_recover_session(
+            client=client,
+            kind="RPC",
+            method=method,
+            payload_id=req_id,
+            do_post=do_post,
+            r=r,
+        )
 
-            if sid and missing_session:
-                # Persist session id and retry once.
-                self._session_id = sid
-                self._headers["mcp-session-id"] = sid
-                r = await do_post()
-
-        r.raise_for_status()
-
-        # Some MCP servers respond with SSE (text/event-stream) even for single responses.
-        content_type = (r.headers.get("content-type") or "").lower()
-        if "text/event-stream" in content_type:
-            data_lines: List[str] = []
-            for line in r.text.splitlines():
-                if line.startswith("data:"):
-                    data_lines.append(line[len("data:"):].strip())
-            if not data_lines:
-                raise RuntimeError("MCP SSE response contained no data lines")
-            data = json.loads(data_lines[-1])
-        else:
-            data = r.json()
-
-        # Capture session id on any successful response as well.
-        sid = r.headers.get("mcp-session-id")
-        if sid and sid != self._session_id:
-            self._session_id = sid
-            self._headers["mcp-session-id"] = sid
-            # New session => must re-run initialization handshake.
-            self._initialized = False
-            self._initialized_session_id = None
-
-        if "error" in data:
-            # JSON-RPC protocol error
-            code = data["error"].get("code")
-            msg = data["error"].get("message")
-            raise RuntimeError(f"MCP JSON-RPC error {code}: {msg}")
-
-        if data.get("id") != req_id:
-            # not fatal, but suspicious
-            raise RuntimeError(f"MCP JSON-RPC id mismatch (sent {req_id}, got {data.get('id')})")
-
-        return data["result"]
-
-    async def _notify(self, client: httpx.AsyncClient, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """Send a JSON-RPC notification (no `id`). Some servers may still respond with an SSE/JSON envelope."""
-        payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params:
-            payload["params"] = params
-
-        async def do_post() -> httpx.Response:
-            headers = dict(self._headers)
-            if self._session_id:
-                headers["mcp-session-id"] = self._session_id
-            return await client.post(self.url, json=payload, headers=headers)
-
-        r = await do_post()
-
-        # Handle servers that require a session id and provide it on first failure.
-        if r.status_code == 400:
-            sid = r.headers.get("mcp-session-id")
-            try:
-                ct_400 = (r.headers.get("content-type") or "").lower()
-                if "text/event-stream" in ct_400:
-                    data_lines_400: List[str] = []
-                    for line in r.text.splitlines():
-                        if line.startswith("data:"):
-                            data_lines_400.append(line[len("data:"):].strip())
-                    data_400 = json.loads(data_lines_400[-1]) if data_lines_400 else None
-                else:
-                    data_400 = r.json()
-            except Exception:
-                data_400 = None
-
-            missing_session = False
-            if isinstance(data_400, dict) and "error" in data_400:
-                msg = (data_400.get("error") or {}).get("message") or ""
-                if "Missing session ID" in msg:
-                    missing_session = True
-
-            if sid and missing_session:
-                self._session_id = sid
-                self._headers["mcp-session-id"] = sid
-                # New session => must re-run initialization handshake.
-                self._initialized = False
-                self._initialized_session_id = None
-                r = await do_post()
+        if r.status_code >= 400:
+            self._log_http_error_diag(r, kind="RPC", method=method, payload_id=req_id)
 
         r.raise_for_status()
 
@@ -219,12 +273,95 @@ class MCPToolProvider:
                     pass
 
         # Capture session id on any response.
-        sid = r.headers.get("mcp-session-id")
-        if sid and sid != self._session_id:
-            self._session_id = sid
-            self._headers["mcp-session-id"] = sid
-            self._initialized = False
-            self._initialized_session_id = None
+        self._capture_session_from_response(r)
+
+        # Some MCP servers respond with SSE (text/event-stream) even for single responses.
+        content_type = (r.headers.get("content-type") or "").lower()
+        if "text/event-stream" in content_type:
+            data_lines: List[str] = []
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+            if not data_lines:
+                raise RuntimeError("MCP SSE response contained no data lines")
+            data = json.loads(data_lines[-1])
+        else:
+            data = r.json()
+
+        # Capture session id on any successful response as well.
+        self._capture_session_from_response(r)
+
+        if "error" in data:
+            # JSON-RPC protocol error
+            code = data["error"].get("code")
+            msg = data["error"].get("message")
+            raise RuntimeError(f"MCP JSON-RPC error {code}: {msg}")
+
+        if data.get("id") != req_id:
+            # not fatal, but suspicious
+            raise RuntimeError(f"MCP JSON-RPC id mismatch (sent {req_id}, got {data.get('id')})")
+
+        return data["result"]
+
+    async def _notify(self, client: httpx.AsyncClient, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Send a JSON-RPC notification (no `id`). Some servers may still respond with an SSE/JSON envelope."""
+        payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params:
+            payload["params"] = params
+
+        async def do_post() -> httpx.Response:
+            headers = dict(self._headers)
+            if self._session_id:
+                headers["mcp-session-id"] = self._session_id
+            return await client.post(self.url, json=payload, headers=headers)
+
+        r = await do_post()
+
+        self._log_request_diag(r, kind="notify", method=method, payload_id=None)
+
+        # Recover if server reports missing/invalid session.
+        r = await self._maybe_recover_session(
+            client=client,
+            kind="notify",
+            method=method,
+            payload_id=None,
+            do_post=do_post,
+            r=r,
+        )
+
+        if r.status_code >= 400:
+            self._log_http_error_diag(r, kind="notify", method=method, payload_id=None)
+
+        r.raise_for_status()
+
+        # If the server sends a JSON-RPC envelope back, surface JSON-RPC errors.
+        content_type = (r.headers.get("content-type") or "").lower()
+        if "text/event-stream" in content_type:
+            data_lines: List[str] = []
+            for line in r.text.splitlines():
+                if line.startswith("data:"):
+                    data_lines.append(line[len("data:"):].strip())
+            if data_lines:
+                data = json.loads(data_lines[-1])
+                if isinstance(data, dict) and "error" in data:
+                    code = (data["error"] or {}).get("code")
+                    msg = (data["error"] or {}).get("message")
+                    raise RuntimeError(f"MCP JSON-RPC error {code}: {msg}")
+        else:
+            # Many servers return an empty body for notifications; if not empty, it may be JSON.
+            if r.content:
+                try:
+                    data = r.json()
+                    if isinstance(data, dict) and "error" in data:
+                        code = (data["error"] or {}).get("code")
+                        msg = (data["error"] or {}).get("message")
+                        raise RuntimeError(f"MCP JSON-RPC error {code}: {msg}")
+                except Exception:
+                    pass
+
+        # Capture session id on any response.
+        self._capture_session_from_response(r)
+
 
     async def _ensure_initialized(self, client: httpx.AsyncClient) -> None:
         """Run MCP initialize handshake once per session."""
