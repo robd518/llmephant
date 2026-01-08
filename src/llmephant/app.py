@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter
 from llmephant.core.logger import setup_logger
+from llmephant.core.settings import settings
+from llmephant.core.tooling_config import ToolingConfigError, load_tooling_config, tooling_snapshot
 from llmephant.routers import chat_router, memory_router, models_router, health_router
 from llmephant.services.embedding_service import init_embedder
 from llmephant.repositories.qdrant_repository import init_qdrant
@@ -15,11 +17,6 @@ logger = setup_logger(__name__)
 async def lifespan(app: FastAPI):
     try:
         logger.info("🐘🚀 Starting up llmephant!")
-        mcp = MCPToolProvider(
-            name="Test MCP",
-            url="http://macbook-pro.cinnebar-mamba.ts.net:8000/mcp",
-            tool_name_prefix="test_mcp__"
-        )
         init_embedder()
         init_qdrant()
 
@@ -30,22 +27,81 @@ async def lifespan(app: FastAPI):
         app.state.tools_enabled = False
         app.state.tooling_init_error = None
 
+        # Track providers so we can close them on shutdown.
+        app.state.tool_providers = []
+
+        tooling_errors: dict[str, str] = {}
+        tools_imported = 0
+
         try:
-            await import_mcp_tools(app.state.registry, mcp)
-            app.state.tools_enabled = True
-            logger.info("✅ Tooling initialized (%d tools)", len(app.state.registry.openai_tools()))
+            cfg = load_tooling_config(settings.TOOLING_CONFIG_FILE)
+            logger.info("Tooling config loaded: %s", tooling_snapshot(cfg))
+
+            if not cfg.enabled:
+                logger.info("Tooling disabled by config (enabled=false); continuing without tools")
+            else:
+                for server in cfg.mcp_servers:
+                    if not server.enabled:
+                        continue
+
+                    provider = MCPToolProvider(
+                        name=server.name,
+                        url=server.url,
+                        tool_name_prefix=server.tool_name_prefix,
+                        headers=server.headers,
+                        timeout_s=server.timeout_s,
+                        allow_tools=set(server.allow_tools) if server.allow_tools else None,
+                        deny_tools=set(server.deny_tools) if server.deny_tools else None,
+                    )
+                    app.state.tool_providers.append(provider)
+
+                    try:
+                        await import_mcp_tools(app.state.registry, provider)
+                        tools_imported += 1
+                        logger.info(
+                            "✅ MCP server '%s' registered (%d tools total)",
+                            server.name,
+                            len(app.state.registry.openai_tools()),
+                        )
+                    except Exception as e:
+                        tooling_errors[server.name] = str(e)
+                        logger.exception(
+                            "⚠️ MCP server '%s' failed to initialize; continuing without this server",
+                            server.name,
+                        )
+
+            app.state.tools_enabled = tools_imported > 0
+
+            # Only set tooling_init_error when something actually went wrong.
+            app.state.tooling_init_error = tooling_errors or None
+
+            if app.state.tools_enabled:
+                logger.info(
+                    "✅ Tooling initialized (%d tools)",
+                    len(app.state.registry.openai_tools()),
+                )
+            else:
+                logger.warning("⚠️ Tooling not enabled (no servers loaded successfully)")
+
+        except ToolingConfigError as e:
+            app.state.tooling_init_error = {"config": str(e)}
+            logger.exception("⚠️ Tooling config invalid/unavailable; continuing without tools")
         except Exception as e:
-            app.state.tooling_init_error = str(e)
+            app.state.tooling_init_error = {"startup": str(e)}
             logger.exception("⚠️ Tooling initialization failed; continuing without tools")
 
         yield
         logger.info("🐘🛑 Shutting down.")
 
-        # Clean up provider resources if the provider exposes a close hook.
-        if hasattr(mcp, "aclose"):
-            await mcp.aclose()
-        elif hasattr(mcp, "close"):
-            mcp.close()
+        # Clean up provider resources if providers expose close hooks.
+        for provider in getattr(app.state, "tool_providers", []) or []:
+            try:
+                if hasattr(provider, "aclose"):
+                    await provider.aclose()
+                elif hasattr(provider, "close"):
+                    provider.close()
+            except Exception:
+                logger.exception("Failed to close tool provider cleanly")
 
     except Exception as e:
         logger.exception("FastAPI failed to start")
