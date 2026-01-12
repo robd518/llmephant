@@ -7,10 +7,14 @@ from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMess
 from llmephant.models.chat_model import ChatMessage
 from llmephant.tools.executor import ToolResult
 from llmephant.services.memory_service import (
+    augment_messages_with_analysis_memories,
     augment_messages_with_memory,
+    augment_messages_with_workspace_memories,
     extract_and_store_memory,
     handle_explicit_remember_request,
+    search_relevant_analysis_memories,
     search_relevant_memories,
+    search_relevant_workspace_memories,
 )
 from llmephant.services.upstream_llm import chat_upstream, chat_upstream_stream
 from llmephant.utils.text import get_last_user_message
@@ -99,6 +103,36 @@ def _is_openwebui_sidecar_prompt(text: str) -> bool:
     return False
 
 
+def _apply_memory_context(user_id: str, messages: List[ChatMessage], last_msg: str) -> List[ChatMessage]:
+    """Inject memory context for the turn.
+
+    We keep three namespaces:
+      - user facts ("VERIFIED FACTS about the USER")
+      - current work context ("CURRENT WORK CONTEXT")
+      - investigation notes ("PRIOR INVESTIGATION NOTES")
+
+    Sidecar prompts should bypass this entirely.
+    """
+    handle_explicit_remember_request(user_id, last_msg)
+
+    user_memories = search_relevant_memories(user_id, last_msg)
+    workspace_memories = search_relevant_workspace_memories(user_id, last_msg)
+    analysis_memories = search_relevant_analysis_memories(user_id, last_msg)
+
+    logger.info(
+        f"memory.inject user_id={user_id} user_memories={len(user_memories)} "
+        f"workspace_memories={len(workspace_memories)} analysis_memories={len(analysis_memories)}"
+    )
+
+    # Apply in a stable order.
+    # - Investigation notes and workspace context are advisory.
+    # - User facts are higher-priority.
+    out = augment_messages_with_analysis_memories(messages, analysis_memories)
+    out = augment_messages_with_workspace_memories(out, workspace_memories)
+    out = augment_messages_with_memory(out, user_memories)
+    return out
+
+
 def _accumulate_tool_call_deltas(
     acc: Dict[int, Dict[str, Any]],
     deltas: List[Dict[str, Any]],
@@ -149,12 +183,34 @@ async def _finalize_completion(
         return
 
     try:
+        # Sliding window: include enough messages to reliably capture recent tool calls/results.
+        window = messages[-30:]
+        n_msgs = len(window)
+
+        # Best-effort tool-context stats (no content logged).
+        n_tool_msgs = 0
+        n_assistant_tool_call_msgs = 0
+        for m in window:
+            role = getattr(m, "role", None)
+            if role == "tool":
+                n_tool_msgs += 1
+            if role == "assistant" and getattr(m, "tool_calls", None):
+                n_assistant_tool_call_msgs += 1
+
+        logger.info(
+            f"memory.extract.invoke user_id={user_id} model={model_name} n_msgs={n_msgs} "
+            f"n_tool_msgs={n_tool_msgs} n_assistant_tool_call_msgs={n_assistant_tool_call_msgs} "
+            f"assistant_reply_len={len(assistant_reply)}"
+        )
+
         ok = await extract_and_store_memory(
             user_id=user_id,
-            messages=messages[-6:],  # sliding window
+            messages=window,
             assistant_reply=assistant_reply,
             model_name=model_name,
         )
+
+        logger.info(f"memory.extract.result user_id={user_id} ok={ok}")
         if ok:
             logger.info("Memory extraction completed and facts were accepted.")
         else:
@@ -186,9 +242,7 @@ async def run_chat_runtime_stream(
         req.tools = None
         req.tool_choice = None
     else:
-        handle_explicit_remember_request(user_id, last_msg)
-        memories = search_relevant_memories(user_id, last_msg)
-        req.messages = augment_messages_with_memory(req.messages, memories)
+        req.messages = _apply_memory_context(user_id, req.messages, last_msg)
 
     # Sidecar streaming: passthrough streaming, no tools, no memory extraction.
     if is_sidecar:
@@ -430,10 +484,7 @@ async def run_chat_runtime(
         req.tools = None
         req.tool_choice = None
     else:
-        handle_explicit_remember_request(user_id, last_msg)
-
-        memories = search_relevant_memories(user_id, last_msg)
-        req.messages = augment_messages_with_memory(req.messages, memories)
+        req.messages = _apply_memory_context(user_id, req.messages, last_msg)
 
     # ---- Non-streaming mode: call upstream and emit final payload ----
     if is_sidecar:
