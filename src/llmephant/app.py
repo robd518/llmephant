@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, APIRouter
+import httpx
 from llmephant.core.logger import setup_logger
 from llmephant.core.settings import settings
 from llmephant.core.tooling_config import ToolingConfigError, load_tooling_config, tooling_snapshot
@@ -63,6 +64,10 @@ async def lifespan(app: FastAPI):
                             server.name,
                             len(app.state.registry.openai_tools()),
                         )
+
+                    except httpx.ConnectError as e:
+                        logger.warning(f"Tool server unreachable; skipping provider='{provider.name}' err='{e}'")
+
                     except Exception as e:
                         tooling_errors[server.name] = str(e)
                         logger.exception(
@@ -86,6 +91,7 @@ async def lifespan(app: FastAPI):
         except ToolingConfigError as e:
             app.state.tooling_init_error = {"config": str(e)}
             logger.exception("⚠️ Tooling config invalid/unavailable; continuing without tools")
+
         except Exception as e:
             app.state.tooling_init_error = {"startup": str(e)}
             logger.exception("⚠️ Tooling initialization failed; continuing without tools")
