@@ -12,12 +12,42 @@ from llmephant.services.upstream_llm import chat_upstream
 logger = setup_logger(__name__)
 
 
+
 def _log_memory(event: str, **fields: Any) -> None:
     """Structured-ish memory logging without leaking message content."""
     safe: Dict[str, Any] = {k: v for k, v in fields.items() if v is not None}
     # Keep logs compact and stable.
     parts = " ".join(f"{k}={safe[k]!r}" for k in sorted(safe.keys()))
     logger.info(f"memory.{event}" + (f" {parts}" if parts else ""))
+
+
+# --- Added helpers for memory request knob plumbing ---
+def _filter_chatrequest_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter kwargs to keys supported by ChatRequest (Pydantic v1/v2 safe)."""
+    fields = getattr(ChatRequest, "model_fields", None) or getattr(ChatRequest, "__fields__", None)
+    allowed = set(fields.keys()) if isinstance(fields, dict) else None
+    out: Dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        if allowed is not None and k not in allowed:
+            continue
+        out[k] = v
+    return out
+
+
+def _memory_request_knobs() -> Dict[str, Any]:
+    """Return configurable memory-request knobs if present in settings."""
+    return {
+        # Common OpenAI-style knobs; only included if present on settings.
+        "max_tokens": getattr(settings, "MEMORY_MAX_TOKENS", None),
+        "max_completion_tokens": getattr(settings, "MEMORY_MAX_COMPLETION_TOKENS", None),
+        "reasoning_effort": getattr(settings, "MEMORY_REASONING_EFFORT", None),
+        "reasoning": getattr(settings, "MEMORY_REASONING", None),
+        "top_p": getattr(settings, "MEMORY_TOP_P", None),
+        "stop": getattr(settings, "MEMORY_STOP", None),
+        "response_format": getattr(settings, "MEMORY_RESPONSE_FORMAT", None),
+    }
 
 
 
@@ -355,6 +385,7 @@ async def _distill_investigation_memories(
     assistant_reply: str,
     model_name: str,
     tool_names: List[str],
+    req_id: Optional[str] = None,
 ) -> List[str]:
     """Distill recall-friendly investigation notes from the user question + assistant answer.
 
@@ -420,16 +451,20 @@ async def _distill_investigation_memories(
         ),
     ]
 
-    resp = await chat_upstream(
-        ChatRequest(
-            model=chosen_model,
-            messages=convo,
-            temperature=0.0,
-        )
+    knobs = _memory_request_knobs()
+    req_kwargs = _filter_chatrequest_kwargs(
+        {
+            "model": chosen_model,
+            "messages": convo,
+            "temperature": 0.0,
+            **knobs,
+        }
     )
 
+    resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
+
     if not isinstance(resp, dict) or "choices" not in resp or "error" in resp:
-        _log_memory("analysis.skip.upstream_error", user_id=user_id, model=chosen_model)
+        _log_memory("analysis.skip.upstream_error", user_id=user_id, model=chosen_model, req_id=req_id)
         logger.error(f"Investigation memory distiller upstream error/shape: {resp}")
         return []
 
@@ -446,7 +481,7 @@ async def _distill_investigation_memories(
 
     obj = _extract_json_object(content)
     if obj is None:
-        _log_memory("analysis.skip.parse_failed", user_id=user_id, model=chosen_model, content_len=len(content))
+        _log_memory("analysis.skip.parse_failed", user_id=user_id, model=chosen_model, content_len=len(content), req_id=req_id)
         logger.error(
             "Failed to parse investigation distiller response as JSON object. "
             f"Raw startswith={content[:160]!r}"
@@ -455,12 +490,12 @@ async def _distill_investigation_memories(
 
     store = bool(obj.get("store", False))
     if not store:
-        _log_memory("analysis.skip.store_false", user_id=user_id, model=chosen_model)
+        _log_memory("analysis.skip.store_false", user_id=user_id, model=chosen_model, req_id=req_id)
         return []
 
     memories = obj.get("memories", [])
     if not isinstance(memories, list):
-        _log_memory("analysis.skip.bad_shape", user_id=user_id, model=chosen_model)
+        _log_memory("analysis.skip.bad_shape", user_id=user_id, model=chosen_model, req_id=req_id)
         return []
 
     out_texts: List[str] = []
@@ -494,7 +529,7 @@ async def _distill_investigation_memories(
 
         out_texts.append(note)
 
-    _log_memory("analysis.distilled", user_id=user_id, model=chosen_model, n_notes=len(out_texts), n_tools=len(tool_names))
+    _log_memory("analysis.distilled", user_id=user_id, model=chosen_model, n_notes=len(out_texts), n_tools=len(tool_names), req_id=req_id)
     return out_texts
 
 
@@ -503,6 +538,7 @@ async def extract_and_store_memory(
     messages: List[ChatMessage],
     assistant_reply: str,
     model_name: str,
+    req_id: Optional[str] = None,
 ) -> bool:
     """
     Returns True only when any memories were extracted AND stored.
@@ -512,10 +548,29 @@ async def extract_and_store_memory(
       - Investigation-note distillation is separate and may still store notes even when USER-facts are skipped.
     """
     if not settings.ENABLE_MEMORY_EXTRACTION:
-        _log_memory("skip.disabled", user_id=user_id)
+        _log_memory("skip.disabled", user_id=user_id, req_id=req_id)
         return False
 
     stored_any = False
+
+    # Source-of-truth: log models and knobs for memory distillation/extraction.
+    chosen_model = settings.MEMORY_MODEL_NAME or model_name
+    if not settings.MEMORY_MODEL_NAME:
+        logger.warning(
+            "MEMORY_MODEL_NAME is not set; falling back to the chat model for memory extraction. "
+            "If your chat model does not reliably output JSON in message.content, set MEMORY_MODEL_NAME."
+        )
+
+    knobs = _memory_request_knobs()
+    _log_memory(
+        "models.selected",
+        req_id=req_id,
+        user_id=user_id,
+        distill_model=chosen_model,
+        extract_model=chosen_model,
+        temperature=0.0,
+        **knobs,
+    )
 
     # Investigation-note distillation is independent of USER-facts extraction.
     try:
@@ -526,16 +581,17 @@ async def extract_and_store_memory(
             assistant_reply=assistant_reply,
             model_name=model_name,
             tool_names=tool_names,
+            req_id=req_id,
         )
         if notes:
             inserted_notes = store_investigation_memories(user_id, notes)
             if inserted_notes > 0:
                 stored_any = True
-                _log_memory("analysis.store.ok", user_id=user_id, inserted=inserted_notes)
+                _log_memory("analysis.store.ok", user_id=user_id, inserted=inserted_notes, req_id=req_id)
             else:
-                _log_memory("analysis.store.deduped", user_id=user_id)
+                _log_memory("analysis.store.deduped", user_id=user_id, req_id=req_id)
         else:
-            _log_memory("analysis.skip.no_notes", user_id=user_id, n_tools=len(tool_names))
+            _log_memory("analysis.skip.no_notes", user_id=user_id, n_tools=len(tool_names), req_id=req_id)
     except Exception as e:
         logger.error(f"Failed to distill/store investigation memories: {e}")
 
@@ -548,18 +604,11 @@ async def extract_and_store_memory(
 
     n_user_msgs = sum(1 for m in messages if m.role == "user" and m.content)
     transcript_len = len(transcript)
-    _log_memory("extract.start", user_id=user_id, n_user_msgs=n_user_msgs, transcript_len=transcript_len)
+    _log_memory("extract.start", user_id=user_id, n_user_msgs=n_user_msgs, transcript_len=transcript_len, req_id=req_id)
 
     if not transcript:
-        _log_memory("skip.empty_user_transcript", user_id=user_id, n_user_msgs=n_user_msgs)
+        _log_memory("skip.empty_user_transcript", user_id=user_id, n_user_msgs=n_user_msgs, req_id=req_id)
         return stored_any
-
-    chosen_model = settings.MEMORY_MODEL_NAME or model_name
-    if not settings.MEMORY_MODEL_NAME:
-        logger.warning(
-            "MEMORY_MODEL_NAME is not set; falling back to the chat model for memory extraction. "
-            "If your chat model does not reliably output JSON in message.content, set MEMORY_MODEL_NAME."
-        )
 
     convo = [
         ChatMessage(
@@ -593,13 +642,16 @@ async def extract_and_store_memory(
         ChatMessage(role="user", content=transcript),
     ]
 
-    resp = await chat_upstream(
-        ChatRequest(
-            model=chosen_model,
-            messages=convo,
-            temperature=0.0,
-        )
+    req_kwargs = _filter_chatrequest_kwargs(
+        {
+            "model": chosen_model,
+            "messages": convo,
+            "temperature": 0.0,
+            **knobs,
+        }
     )
+
+    resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
 
     if not isinstance(resp, dict):
         logger.error(f"Memory extractor returned non-dict response: {resp}")
@@ -632,6 +684,7 @@ async def extract_and_store_memory(
                 user_id=user_id,
                 model=chosen_model,
                 content_len=len(content),
+                req_id=req_id,
             )
             logger.error(
                 "Failed to parse memory extractor response as JSON object. "
@@ -697,6 +750,7 @@ async def extract_and_store_memory(
             n_workspace=len(workspace_texts),
             dropped_no_evidence=dropped_no_evidence,
             dropped_bad_shape=dropped_bad_shape,
+            req_id=req_id,
         )
     except Exception as e:
         logger.error(
@@ -711,6 +765,7 @@ async def extract_and_store_memory(
             model=chosen_model,
             confidence=conf,
             min_confidence=settings.MEMORY_MIN_CONFIDENCE,
+            req_id=req_id,
         )
         return stored_any
 
@@ -720,6 +775,7 @@ async def extract_and_store_memory(
             user_id=user_id,
             model=chosen_model,
             confidence=conf,
+            req_id=req_id,
         )
         return stored_any
 
@@ -727,16 +783,16 @@ async def extract_and_store_memory(
     inserted_workspace = store_workspace_facts(user_id, workspace_texts)
 
     if inserted_profile > 0:
-        _log_memory("store.ok", user_id=user_id, inserted=inserted_profile)
+        _log_memory("store.ok", user_id=user_id, inserted=inserted_profile, req_id=req_id)
         stored_any = True
     elif profile_texts:
-        _log_memory("skip.deduped", user_id=user_id, inserted=inserted_profile)
+        _log_memory("skip.deduped", user_id=user_id, inserted=inserted_profile, req_id=req_id)
 
     if inserted_workspace > 0:
-        _log_memory("workspace.store.ok", user_id=user_id, inserted=inserted_workspace)
+        _log_memory("workspace.store.ok", user_id=user_id, inserted=inserted_workspace, req_id=req_id)
         stored_any = True
     elif workspace_texts:
-        _log_memory("workspace.skip.deduped", user_id=user_id, inserted=inserted_workspace)
+        _log_memory("workspace.skip.deduped", user_id=user_id, inserted=inserted_workspace, req_id=req_id)
 
     return stored_any
 

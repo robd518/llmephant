@@ -173,11 +173,16 @@ async def _finalize_completion(
     messages: List[Any],
     assistant_reply: str,
     model_name: str,
+    allow_memory_side_effects: bool,
+    req_id: str | None = None,
 ) -> None:
     """
     Called exactly once when an assistant response is fully complete.
     Responsible for memory extraction + storage.
     """
+    if not allow_memory_side_effects:
+        logger.info("Skipping memory extraction: memory side-effects disabled for this request.")
+        return
     if not assistant_reply or not str(assistant_reply).strip():
         logger.info("Skipping memory extraction: empty assistant reply.")
         return
@@ -198,7 +203,7 @@ async def _finalize_completion(
                 n_assistant_tool_call_msgs += 1
 
         logger.info(
-            f"memory.extract.invoke user_id={user_id} model={model_name} n_msgs={n_msgs} "
+            f"memory.extract.invoke req_id={req_id} user_id={user_id} chat_model={model_name} n_msgs={n_msgs} "
             f"n_tool_msgs={n_tool_msgs} n_assistant_tool_call_msgs={n_assistant_tool_call_msgs} "
             f"assistant_reply_len={len(assistant_reply)}"
         )
@@ -208,9 +213,10 @@ async def _finalize_completion(
             messages=window,
             assistant_reply=assistant_reply,
             model_name=model_name,
+            req_id=req_id,
         )
 
-        logger.info(f"memory.extract.result user_id={user_id} ok={ok}")
+        logger.info(f"memory.extract.result req_id={req_id} user_id={user_id} ok={ok}")
         if ok:
             logger.info("Memory extraction completed and facts were accepted.")
         else:
@@ -232,11 +238,13 @@ async def run_chat_runtime_stream(
 
     It yields runtime events; the transport layer is responsible for SSE framing.
     """
-    logger.info(f"Runtime(stream) start for user_id={user_id}")
+    req_id = getattr(request.state, "req_id", None)
+    logger.info(f"Runtime(stream) start req_id={req_id} user_id={user_id}")
 
     last_msg = get_last_user_message(req.messages)
 
     is_sidecar = _is_openwebui_sidecar_prompt(last_msg)
+    allow_memory_side_effects = not is_sidecar
     if is_sidecar:
         logger.info("Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects.")
         req.tools = None
@@ -256,7 +264,9 @@ async def run_chat_runtime_stream(
                     max_tokens=req.max_tokens,
                     user=user_id,
                     stream=True,
-                )
+                    stream_options={"include_usage": True}
+                ),
+                req_id=req_id
             ):
                 yield {"type": "chunk", "chunk": chunk}
         except Exception as e:
@@ -272,6 +282,7 @@ async def run_chat_runtime_stream(
             yield {"type": "done"}
             return
 
+        logger.info("Sidecar streaming request completed: memory extraction is disabled and will not run.")
         yield {"type": "done"}
         return
 
@@ -313,7 +324,7 @@ async def run_chat_runtime_stream(
             if advertise_tools:
                 upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
 
-            async for chunk in chat_upstream_stream(ChatRequest(**upstream_kwargs)):
+            async for chunk in chat_upstream_stream(ChatRequest(**upstream_kwargs), req_id=req_id):
                 choice0 = (chunk.get("choices") or [{}])[0] or {}
                 delta = choice0.get("delta") or {}
 
@@ -450,6 +461,8 @@ async def run_chat_runtime_stream(
                 messages=req.messages,
                 assistant_reply=assistant_reply,
                 model_name=req.model,
+                allow_memory_side_effects=allow_memory_side_effects,
+                req_id=req_id,
             )
 
         yield {"type": "done"}
@@ -467,7 +480,8 @@ async def run_chat_runtime(
     Streaming requests should use `run_chat_runtime_stream` (or we delegate to it for
     backward compatibility).
     """
-    logger.info(f"Runtime start for user_id={user_id}")
+    req_id = getattr(request.state, "req_id", None)
+    logger.info(f"Runtime start req_id={req_id} user_id={user_id}")
 
     last_msg = get_last_user_message(req.messages)
 
@@ -479,6 +493,7 @@ async def run_chat_runtime(
         return
 
     is_sidecar = _is_openwebui_sidecar_prompt(last_msg)
+    allow_memory_side_effects = not is_sidecar
     if is_sidecar:
         logger.info("Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects.")
         req.tools = None
@@ -499,7 +514,8 @@ async def run_chat_runtime(
                     max_tokens=req.max_tokens,
                     user=user_id,
                     stream=False,
-                )
+                ),
+                req_id=req_id,
             )
         except Exception as e:
             logger.exception("Sidecar upstream failed (runtime)")
@@ -514,6 +530,7 @@ async def run_chat_runtime(
             yield {"type": "done"}
             return
 
+        logger.info("Sidecar request completed: memory extraction is disabled and will not run.")
         yield {"type": "final", "payload": upstream_resp}
         yield {"type": "done"}
         return
@@ -549,7 +566,7 @@ async def run_chat_runtime(
             if advertise_tools:
                 upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
 
-            upstream_resp = await chat_upstream(ChatRequest(**upstream_kwargs))
+            upstream_resp = await chat_upstream(ChatRequest(**upstream_kwargs), req_id=req_id)
         except Exception as e:
             logger.exception("Non-streaming upstream failed (runtime)")
             err = ChatErrorMessage(
@@ -648,6 +665,8 @@ async def run_chat_runtime(
             messages=req.messages,
             assistant_reply=assistant_reply,
             model_name=req.model,
+            allow_memory_side_effects=allow_memory_side_effects,
+            req_id=req_id,
         )
 
         yield {"type": "final", "payload": upstream_resp}

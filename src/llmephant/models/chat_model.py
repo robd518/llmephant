@@ -32,6 +32,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
     user: Optional[str] = None
     stream: bool = False
+    stream_options: Optional[Dict[str, Any]] = None
 
     # Optional tool-calling fields (OpenAI-compatible)
     tools: Optional[List[Dict[str, Any]]] = None
