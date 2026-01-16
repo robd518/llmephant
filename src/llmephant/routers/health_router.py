@@ -35,7 +35,9 @@ async def health_tools(raw_req: Request) -> Dict[str, Any]:
         # If registry.openai_tools() explodes, that's useful signal but shouldn't 500 health.
         tool_count = 0
         if tooling_init_error is None:
-            tooling_init_error = "registry.openai_tools() raised while computing tool_count"
+            tooling_init_error = (
+                "registry.openai_tools() raised while computing tool_count"
+            )
 
     payload: Dict[str, Any] = {
         "tools_enabled": tools_enabled,

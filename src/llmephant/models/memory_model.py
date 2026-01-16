@@ -43,6 +43,7 @@ class MemoryPolicy(BaseModel):
       (Your storage layer may still apply defaults.)
     - `extractor_prompt` is optional and only applies when extractor uses the LLM.
     """
+
     store: bool
     scope: MemoryScope = "user"
     extractor: MemoryExtractor = "raw"

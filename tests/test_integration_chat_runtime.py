@@ -7,10 +7,14 @@ import pytest
 
 def _import_chat_service_module():
     # Expected location
-    return __import__("llmephant.services.chat_service", fromlist=["dispatch_chat_request"])
+    return __import__(
+        "llmephant.services.chat_service", fromlist=["dispatch_chat_request"]
+    )
 
 
-async def _fake_run_chat_runtime_stream(*args: Any, **kwargs: Any) -> AsyncIterator[Dict[str, Any]]:
+async def _fake_run_chat_runtime_stream(
+    *args: Any, **kwargs: Any
+) -> AsyncIterator[Dict[str, Any]]:
     """Emit tool-ish events plus output events.
 
     The SSE layer must forward only output and must not leak tool-call JSON.
@@ -28,14 +32,18 @@ async def _fake_run_chat_runtime_stream(*args: Any, **kwargs: Any) -> AsyncItera
         "type": "chunk",
         "chunk": {
             "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}],
+            "choices": [
+                {"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}
+            ],
         },
     }
     yield {
         "type": "chunk",
         "chunk": {
             "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": " world"}, "finish_reason": None}],
+            "choices": [
+                {"index": 0, "delta": {"content": " world"}, "finish_reason": None}
+            ],
         },
     }
 
@@ -53,7 +61,9 @@ def _make_request():
         from llmephant.tools.registry import ToolRegistry
         from llmephant.tools.executor import ToolExecutor
     except Exception:
-        pytest.skip("ToolRegistry/ToolExecutor imports unavailable for integration test")
+        pytest.skip(
+            "ToolRegistry/ToolExecutor imports unavailable for integration test"
+        )
 
     app.state.registry = ToolRegistry()
     app.state.executor = ToolExecutor(app.state.registry)
@@ -83,7 +93,9 @@ async def test_streaming_sse_does_not_forward_tool_events(monkeypatch):
         "run_chat_runtime_streaming",
         "_run_chat_runtime_stream",
     ):
-        monkeypatch.setattr(chat_service, stream_name, _fake_run_chat_runtime_stream, raising=False)
+        monkeypatch.setattr(
+            chat_service, stream_name, _fake_run_chat_runtime_stream, raising=False
+        )
 
     raw_req = _make_request()
 

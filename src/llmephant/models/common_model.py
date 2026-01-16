@@ -5,6 +5,7 @@ import datetime
 
 class APIBase(BaseModel):
     """Common base_model with shared helpers/settings."""
+
     class Config:
         orm_mode = True
         validate_assignment = True

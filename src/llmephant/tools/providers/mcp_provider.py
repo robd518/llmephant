@@ -36,6 +36,7 @@ class MCPToolProvider:
 
     Assumes an HTTP endpoint that accepts JSON-RPC POSTs.
     """
+
     def __init__(
         self,
         *,
@@ -71,7 +72,9 @@ class MCPToolProvider:
     def _full_name(self, provider_tool_name: str) -> str:
         return f"{self.tool_name_prefix}{provider_tool_name}"
 
-    def _req_auth_diag(self, r: httpx.Response) -> tuple[list[str], bool, Optional[str]]:
+    def _req_auth_diag(
+        self, r: httpx.Response
+    ) -> tuple[list[str], bool, Optional[str]]:
         """Return (header_keys, has_auth, auth_scheme) without leaking secret values."""
         req = r.request
         req_hdrs = dict(req.headers) if req is not None else {}
@@ -95,7 +98,7 @@ class MCPToolProvider:
                 data_lines: List[str] = []
                 for line in (r.text or "").splitlines():
                     if line.startswith("data:"):
-                        data_lines.append(line[len("data:"):].strip())
+                        data_lines.append(line[len("data:") :].strip())
                 data = json.loads(data_lines[-1]) if data_lines else None
             else:
                 data = r.json()
@@ -132,7 +135,9 @@ class MCPToolProvider:
             self._initialized = False
             self._initialized_session_id = None
 
-    def _log_request_diag(self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]) -> None:
+    def _log_request_diag(
+        self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]
+    ) -> None:
         """Lightweight request diagnostics (debug only; never logs secrets)."""
         try:
             req = r.request
@@ -153,7 +158,9 @@ class MCPToolProvider:
         except Exception:
             pass
 
-    def _log_http_error_diag(self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]) -> None:
+    def _log_http_error_diag(
+        self, r: httpx.Response, *, kind: str, method: str, payload_id: Optional[int]
+    ) -> None:
         """HTTP error diagnostics (error level; never logs secrets)."""
         try:
             req = r.request
@@ -202,7 +209,11 @@ class MCPToolProvider:
         if not self._is_session_problem(msg):
             return r
 
-        logger.info("MCP session problem (%s): %r; resetting session and re-initializing", kind, msg[:200])
+        logger.info(
+            "MCP session problem (%s): %r; resetting session and re-initializing",
+            kind,
+            msg[:200],
+        )
 
         # Use new session id if server provided it; otherwise clear it.
         self._session_id = sid
@@ -215,7 +226,9 @@ class MCPToolProvider:
 
         return await do_post()
 
-    async def _rpc(self, client: httpx.AsyncClient, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _rpc(
+        self, client: httpx.AsyncClient, method: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         req_id = next(self._ids)
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
         if params:
@@ -253,7 +266,7 @@ class MCPToolProvider:
             data_lines: List[str] = []
             for line in r.text.splitlines():
                 if line.startswith("data:"):
-                    data_lines.append(line[len("data:"):].strip())
+                    data_lines.append(line[len("data:") :].strip())
             if data_lines:
                 data = json.loads(data_lines[-1])
                 if isinstance(data, dict) and "error" in data:
@@ -281,7 +294,7 @@ class MCPToolProvider:
             data_lines: List[str] = []
             for line in r.text.splitlines():
                 if line.startswith("data:"):
-                    data_lines.append(line[len("data:"):].strip())
+                    data_lines.append(line[len("data:") :].strip())
             if not data_lines:
                 raise RuntimeError("MCP SSE response contained no data lines")
             data = json.loads(data_lines[-1])
@@ -299,11 +312,18 @@ class MCPToolProvider:
 
         if data.get("id") != req_id:
             # not fatal, but suspicious
-            raise RuntimeError(f"MCP JSON-RPC id mismatch (sent {req_id}, got {data.get('id')})")
+            raise RuntimeError(
+                f"MCP JSON-RPC id mismatch (sent {req_id}, got {data.get('id')})"
+            )
 
         return data["result"]
 
-    async def _notify(self, client: httpx.AsyncClient, method: str, params: Optional[Dict[str, Any]] = None) -> None:
+    async def _notify(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Send a JSON-RPC notification (no `id`). Some servers may still respond with an SSE/JSON envelope."""
         payload: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if params:
@@ -340,7 +360,7 @@ class MCPToolProvider:
             data_lines: List[str] = []
             for line in r.text.splitlines():
                 if line.startswith("data:"):
-                    data_lines.append(line[len("data:"):].strip())
+                    data_lines.append(line[len("data:") :].strip())
             if data_lines:
                 data = json.loads(data_lines[-1])
                 if isinstance(data, dict) and "error" in data:
@@ -361,7 +381,6 @@ class MCPToolProvider:
 
         # Capture session id on any response.
         self._capture_session_from_response(r)
-
 
     async def _ensure_initialized(self, client: httpx.AsyncClient) -> None:
         """Run MCP initialize handshake once per session."""
@@ -388,7 +407,9 @@ class MCPToolProvider:
     async def list_tools(self) -> List[ProviderTool]:
         tools: List[ProviderTool] = []
 
-        async with httpx.AsyncClient(headers=self._headers, timeout=self._timeout_s) as client:
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=self._timeout_s
+        ) as client:
             await self._ensure_initialized(client)
             cursor: Optional[str] = None
             while True:
@@ -409,7 +430,8 @@ class MCPToolProvider:
                             name=name,
                             title=t.get("title"),
                             description=t.get("description", ""),
-                            input_schema=t.get("inputSchema") or {"type": "object", "properties": {}},
+                            input_schema=t.get("inputSchema")
+                            or {"type": "object", "properties": {}},
                             output_schema=t.get("outputSchema"),
                             annotations=t.get("annotations"),
                         )
@@ -420,8 +442,12 @@ class MCPToolProvider:
                     break
         return tools
 
-    async def call_tool(self, provider_tool_name: str, arguments: Dict[str, Any]) -> ToolCallResult:
-        async with httpx.AsyncClient(headers=self._headers, timeout=self._timeout_s) as client:
+    async def call_tool(
+        self, provider_tool_name: str, arguments: Dict[str, Any]
+    ) -> ToolCallResult:
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=self._timeout_s
+        ) as client:
             await self._ensure_initialized(client)
             result = await self._rpc(
                 client,
@@ -444,7 +470,9 @@ class MCPToolProvider:
 
         if structured is not None:
             # Helpful for memory extraction / downstream parsing
-            parts.append(json.dumps({"structuredContent": structured}, ensure_ascii=False))
+            parts.append(
+                json.dumps({"structuredContent": structured}, ensure_ascii=False)
+            )
 
         text = "\n".join(p for p in parts if p is not None and p != "")
 
@@ -453,7 +481,6 @@ class MCPToolProvider:
             raw=result,
             is_error=bool(result.get("isError", False)),
         )
-
 
     async def aclose(self) -> None:
         """Release any resources held by this provider.

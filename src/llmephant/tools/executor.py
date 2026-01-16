@@ -25,7 +25,9 @@ class ToolExecutor:
     def __init__(self, registry: ToolRegistry) -> None:
         self.registry = registry
 
-    async def execute(self, tool_name: str, arguments: Dict[str, Any] | None) -> ToolResult:
+    async def execute(
+        self, tool_name: str, arguments: Dict[str, Any] | None
+    ) -> ToolResult:
         # Prefer returning ToolResult over raising, so callers have one consistent shape.
         if not isinstance(tool_name, str):
             return ToolResult(

@@ -91,7 +91,9 @@ def _call_register_tool(registry: Any, tool_obj: Any) -> None:
         fn(tool_obj)
 
 
-def _make_registered_tool(name: str, provider_name: str, provider_tool_name: str) -> Any:
+def _make_registered_tool(
+    name: str, provider_name: str, provider_tool_name: str
+) -> Any:
     _ToolRegistry, RegisteredTool = _import_registry_symbols()
 
     parameters = {"type": "object", "properties": {"text": {"type": "string"}}}
@@ -195,7 +197,9 @@ async def test_executor_args_none_coerces_to_empty_dict(registry, executor):
 
 
 @pytest.mark.asyncio
-async def test_executor_normalizes_dict_provider_return_to_toolresult(registry, executor):
+async def test_executor_normalizes_dict_provider_return_to_toolresult(
+    registry, executor
+):
     _ToolExecutor, ToolResult = _import_executor_symbols()
 
     provider = FakeProvider("mcp", return_shape="dict")
@@ -212,7 +216,9 @@ async def test_executor_normalizes_dict_provider_return_to_toolresult(registry, 
 
 
 @pytest.mark.asyncio
-async def test_executor_normalizes_attr_provider_return_to_toolresult(registry, executor):
+async def test_executor_normalizes_attr_provider_return_to_toolresult(
+    registry, executor
+):
     _ToolExecutor, ToolResult = _import_executor_symbols()
 
     provider = FakeProvider("mcp", return_shape="attr")
@@ -258,8 +264,12 @@ def _import_chat_runtime_helpers():
     last_err: Optional[Exception] = None
     for mod_name in candidates:
         try:
-            mod = __import__(mod_name, fromlist=["_tool_result_to_content", "_require_tooling"])
-            return getattr(mod, "_tool_result_to_content"), getattr(mod, "_require_tooling")
+            mod = __import__(
+                mod_name, fromlist=["_tool_result_to_content", "_require_tooling"]
+            )
+            return getattr(mod, "_tool_result_to_content"), getattr(
+                mod, "_require_tooling"
+            )
         except Exception as e:
             last_err = e
 
@@ -343,7 +353,6 @@ def test_require_tooling_passes_when_both_present():
     _require_tooling(req)
 
 
-
 # ----------------------------
 # Item 3: tool advertisement gating (no tools/tool_choice when disabled)
 # ----------------------------
@@ -358,13 +367,18 @@ def _import_chat_runtime_runners():
     last_err: Optional[Exception] = None
     for mod_name in candidates:
         try:
-            mod = __import__(mod_name, fromlist=["run_chat_runtime", "run_chat_runtime_stream"])
-            return mod, getattr(mod, "run_chat_runtime"), getattr(mod, "run_chat_runtime_stream")
+            mod = __import__(
+                mod_name, fromlist=["run_chat_runtime", "run_chat_runtime_stream"]
+            )
+            return (
+                mod,
+                getattr(mod, "run_chat_runtime"),
+                getattr(mod, "run_chat_runtime_stream"),
+            )
         except Exception as e:
             last_err = e
 
     raise ImportError(f"Could not import chat_runtime runners: {last_err}")
-
 
 
 # Inserted dataclasses for object-based mock returns
@@ -421,11 +435,7 @@ async def test_tools_disabled_omits_tools_and_tool_choice_non_streaming(monkeypa
 
     async def fake_chat_upstream(chat_req):
         captured["kwargs"] = getattr(chat_req, "kwargs", {})
-        return {
-            "choices": [
-                {"message": {"role": "assistant", "content": "ok"}}
-            ]
-        }
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
     monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
     monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)
@@ -472,7 +482,9 @@ async def test_tools_disabled_omits_tools_and_tool_choice_streaming(monkeypatch)
     )
     req = _DummyChatReq()
 
-    async for event in run_chat_runtime_stream(req, user_id="test-user", request=request):
+    async for event in run_chat_runtime_stream(
+        req, user_id="test-user", request=request
+    ):
         if event.get("type") == "done":
             break
 
@@ -492,11 +504,7 @@ async def test_tools_enabled_but_empty_list_omits_tools_and_tool_choice(monkeypa
 
     async def fake_chat_upstream(chat_req):
         captured["kwargs"] = getattr(chat_req, "kwargs", {})
-        return {
-            "choices": [
-                {"message": {"role": "assistant", "content": "ok"}}
-            ]
-        }
+        return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
 
     monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
     monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)

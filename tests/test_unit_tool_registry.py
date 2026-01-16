@@ -70,14 +70,23 @@ def _call_register_tool(registry: Any, **tool_fields: Any) -> None:
                 if k in ctor_params:
                     kwargs[k] = v
 
-            if "parameters" in ctor_params and "parameters" not in kwargs and "input_schema" in fields:
+            if (
+                "parameters" in ctor_params
+                and "parameters" not in kwargs
+                and "input_schema" in fields
+            ):
                 kwargs["parameters"] = fields["input_schema"]
-            if "input_schema" in ctor_params and "input_schema" not in kwargs and "parameters" in fields:
+            if (
+                "input_schema" in ctor_params
+                and "input_schema" not in kwargs
+                and "parameters" in fields
+            ):
                 kwargs["input_schema"] = fields["parameters"]
 
             tool = RegisteredTool(**kwargs)
             return tool
         except Exception:
+
             class _ToolObj:
                 pass
 

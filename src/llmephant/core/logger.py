@@ -4,17 +4,15 @@ from typing import Optional
 
 
 def setup_logger(
-    name: str = __name__,
-    level: int = logging.INFO,
-    log_file: Optional[str] = None
+    name: str = __name__, level: int = logging.INFO, log_file: Optional[str] = None
 ) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.handlers = []
     logger.setLevel(level)
 
     formatter = logging.Formatter(
-        '[%(asctime)s]\t%(levelname)s\t%(name)s:%(lineno)d]\t%(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
+        "[%(asctime)s]\t%(levelname)s\t%(name)s:%(lineno)d]\t%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
     if not logger.handlers:

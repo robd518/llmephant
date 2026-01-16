@@ -5,6 +5,7 @@ from llmephant.utils.get_user import get_user_from_request
 
 router = APIRouter()
 
+
 @router.post("/completions")
 async def chat_completions(raw_req: Request):
     body = await raw_req.json()

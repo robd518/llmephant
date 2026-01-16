@@ -19,7 +19,11 @@ async def dispatch_chat_request(req: ChatRequest, raw_req: Request):
     raw_req.state.req_id = req_id
 
     # Immediately fail if app.state.executor or app.state.registry is not set up.
-    missing = [k for k in ("registry", "executor") if getattr(raw_req.app.state, k, None) is None]
+    missing = [
+        k
+        for k in ("registry", "executor")
+        if getattr(raw_req.app.state, k, None) is None
+    ]
     if missing:
         err = ChatErrorMessage(
             error=ErrorMessage(
@@ -28,8 +32,15 @@ async def dispatch_chat_request(req: ChatRequest, raw_req: Request):
                 retryable=True,
             )
         )
-        logger.error("Tooling not initialized on app.state. req_id=%s Missing=%s state_keys=%s", req_id, missing, list(vars(raw_req.app.state).keys()))
-        return JSONResponse(content=err.model_dump(), status_code=503, headers={"X-Request-Id": req_id})
+        logger.error(
+            "Tooling not initialized on app.state. req_id=%s Missing=%s state_keys=%s",
+            req_id,
+            missing,
+            list(vars(raw_req.app.state).keys()),
+        )
+        return JSONResponse(
+            content=err.model_dump(), status_code=503, headers={"X-Request-Id": req_id}
+        )
 
     user_id = raw_req.headers.get("x-user-id") or req.user or "user"
     logger.info(f"Dispatching chat request req_id={req_id} user_id={user_id}")
@@ -38,7 +49,9 @@ async def dispatch_chat_request(req: ChatRequest, raw_req: Request):
         logger.info(f"Dispatching streaming chat request (runtime) req_id={req_id}.")
 
         async def sse_generator():
-            async for event in run_chat_runtime_stream(req, user_id=user_id, request=raw_req):
+            async for event in run_chat_runtime_stream(
+                req, user_id=user_id, request=raw_req
+            ):
                 etype = event.get("type")
 
                 # Forward only streamed output to the client.

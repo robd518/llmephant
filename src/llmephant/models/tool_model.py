@@ -14,6 +14,7 @@ class ToolDefinition(BaseModel):
     - `provider` is optional and helps disambiguate collisions when multiple tool
       backends provide the same `name`.
     """
+
     name: str
     description: str
     input_schema: Dict[str, Any]
@@ -37,6 +38,7 @@ class ToolCall(BaseModel):
     - `arguments` should be the decoded JSON arguments.
     - `call_id` is optional but useful for correlating results (OpenAI uses "id").
     """
+
     name: str
     arguments: Dict[str, Any] = Field(default_factory=dict)
     call_id: Optional[str] = None
@@ -50,6 +52,7 @@ class ToolResult(BaseModel):
     """
     The result of executing a ToolCall.
     """
+
     name: str
     result: Any = None
 

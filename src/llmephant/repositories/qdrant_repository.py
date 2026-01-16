@@ -6,6 +6,7 @@ import uuid
 
 client = None
 
+
 def init_qdrant():
     global client
     client = QdrantClient(url=settings.QDRANT_URL, prefer_grpc=False)
@@ -13,9 +14,10 @@ def init_qdrant():
     existing = client.get_collections()
     if settings.QDRANT_COLLECTION not in {c.name for c in existing.collections}:
         from services.embedding_service import vector_dim
+
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE)
+            vectors_config=VectorParams(size=vector_dim, distance=Distance.COSINE),
         )
 
 

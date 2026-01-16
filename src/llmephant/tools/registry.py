@@ -47,6 +47,7 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
+
 async def import_mcp_tools(registry: ToolRegistry, mcp_provider) -> None:
     registry.register_provider(mcp_provider)
     tools = await mcp_provider.list_tools()

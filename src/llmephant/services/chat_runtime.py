@@ -67,7 +67,6 @@ def _tool_result_to_content(tool_result: ToolResult) -> str:
     return json.dumps(val, ensure_ascii=False)
 
 
-
 # Runtime emits events that the transport layer can adapt to HTTP/SSE.
 # event["type"] in {"chunk", "token", "final", "error", "done"}
 # - chunk: a raw upstream chunk (streaming mode; safe-to-forward output chunks only)
@@ -94,16 +93,18 @@ def _is_openwebui_sidecar_prompt(text: str) -> bool:
         return True
     if "Suggest 3-5 relevant follow-up questions" in t and "<chat_history>" in t:
         return True
-    if "\"follow_ups\"" in t and "<chat_history>" in t:
+    if '"follow_ups"' in t and "<chat_history>" in t:
         return True
-    if "\"tags\"" in t and "<chat_history>" in t:
+    if '"tags"' in t and "<chat_history>" in t:
         return True
-    if "\"title\"" in t and "<chat_history>" in t:
+    if '"title"' in t and "<chat_history>" in t:
         return True
     return False
 
 
-def _apply_memory_context(user_id: str, messages: List[ChatMessage], last_msg: str) -> List[ChatMessage]:
+def _apply_memory_context(
+    user_id: str, messages: List[ChatMessage], last_msg: str
+) -> List[ChatMessage]:
     """Inject memory context for the turn.
 
     We keep three namespaces:
@@ -181,7 +182,9 @@ async def _finalize_completion(
     Responsible for memory extraction + storage.
     """
     if not allow_memory_side_effects:
-        logger.info("Skipping memory extraction: memory side-effects disabled for this request.")
+        logger.info(
+            "Skipping memory extraction: memory side-effects disabled for this request."
+        )
         return
     if not assistant_reply or not str(assistant_reply).strip():
         logger.info("Skipping memory extraction: empty assistant reply.")
@@ -220,7 +223,9 @@ async def _finalize_completion(
         if ok:
             logger.info("Memory extraction completed and facts were accepted.")
         else:
-            logger.info("Memory extraction ran but produced no storable facts (or was skipped).")
+            logger.info(
+                "Memory extraction ran but produced no storable facts (or was skipped)."
+            )
     except Exception:
         logger.exception("Memory extraction failed (non-fatal).")
 
@@ -246,7 +251,9 @@ async def run_chat_runtime_stream(
     is_sidecar = _is_openwebui_sidecar_prompt(last_msg)
     allow_memory_side_effects = not is_sidecar
     if is_sidecar:
-        logger.info("Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects.")
+        logger.info(
+            "Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects."
+        )
         req.tools = None
         req.tool_choice = None
     else:
@@ -264,9 +271,9 @@ async def run_chat_runtime_stream(
                     max_tokens=req.max_tokens,
                     user=user_id,
                     stream=True,
-                    stream_options={"include_usage": True}
+                    stream_options={"include_usage": True},
                 ),
-                req_id=req_id
+                req_id=req_id,
             ):
                 yield {"type": "chunk", "chunk": chunk}
         except Exception as e:
@@ -282,7 +289,9 @@ async def run_chat_runtime_stream(
             yield {"type": "done"}
             return
 
-        logger.info("Sidecar streaming request completed: memory extraction is disabled and will not run.")
+        logger.info(
+            "Sidecar streaming request completed: memory extraction is disabled and will not run."
+        )
         yield {"type": "done"}
         return
 
@@ -318,13 +327,21 @@ async def run_chat_runtime_stream(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 max_tokens=req.max_tokens,
+                max_completion_tokens=getattr(req, "max_completion_tokens", None),
+                stop=getattr(req, "stop", None),
+                response_format=getattr(req, "response_format", None),
+                reasoning_effort=getattr(req, "reasoning_effort", None),
+                reasoning=getattr(req, "reasoning", None),
                 user=user_id,
                 stream=True,
+                stream_options={"include_usage": True},
             )
             if advertise_tools:
                 upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
 
-            async for chunk in chat_upstream_stream(ChatRequest(**upstream_kwargs), req_id=req_id):
+            async for chunk in chat_upstream_stream(
+                ChatRequest(**upstream_kwargs), req_id=req_id
+            ):
                 choice0 = (chunk.get("choices") or [{}])[0] or {}
                 delta = choice0.get("delta") or {}
 
@@ -360,7 +377,6 @@ async def run_chat_runtime_stream(
 
         # If tool calls were requested, execute them and restart streaming.
         if saw_tool_calls and tool_calls_acc:
-
             if iteration > max_tool_iterations:
                 err = ChatErrorMessage(
                     error=ErrorMessage(
@@ -379,7 +395,11 @@ async def run_chat_runtime_stream(
             for tc in tool_calls_raw:
                 fn = tc.get("function") or {}
                 args_preview_src = fn.get("arguments") or ""
-                preview = args_preview_src[:60] if isinstance(args_preview_src, str) else str(args_preview_src)[:60]
+                preview = (
+                    args_preview_src[:60]
+                    if isinstance(args_preview_src, str)
+                    else str(args_preview_src)[:60]
+                )
                 if isinstance(preview, str):
                     preview = preview.replace("\n", "\\n").replace("\r", "\\r")
 
@@ -393,7 +413,9 @@ async def run_chat_runtime_stream(
                         "args_preview": repr(preview),
                     }
                 )
-            logger.info(f"[tool-stream] assembled tool_calls (iteration={iteration}): {assembled_summary}")
+            logger.info(
+                f"[tool-stream] assembled tool_calls (iteration={iteration}): {assembled_summary}"
+            )
 
             # Ensure each tool call has an id for tool responses.
             for i, tc in enumerate(tool_calls_raw):
@@ -420,7 +442,11 @@ async def run_chat_runtime_stream(
                 )
 
                 try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+                    args = (
+                        json.loads(args_str)
+                        if isinstance(args_str, str)
+                        else (args_str or {})
+                    )
                 except Exception as e:
                     logger.warning(
                         f"[tool-stream] failed to parse tool args as JSON (iteration={iteration}) name={name} call_id={call_id}: {e}"
@@ -433,7 +459,9 @@ async def run_chat_runtime_stream(
                     logger.exception(
                         f"[tool-stream] tool execution raised (iteration={iteration}) name={name} call_id={call_id}"
                     )
-                    tool_result = ToolResult(result=None, is_error=True, error=str(e), raw=None)
+                    tool_result = ToolResult(
+                        result=None, is_error=True, error=str(e), raw=None
+                    )
 
                 logger.info(
                     f"[tool-stream] tool complete (iteration={iteration}) name={name} call_id={call_id} is_error={tool_result.is_error} result_type={type(tool_result.result).__name__}"
@@ -495,7 +523,9 @@ async def run_chat_runtime(
     is_sidecar = _is_openwebui_sidecar_prompt(last_msg)
     allow_memory_side_effects = not is_sidecar
     if is_sidecar:
-        logger.info("Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects.")
+        logger.info(
+            "Detected OpenWebUI sidecar task prompt; disabling tools and memory side-effects."
+        )
         req.tools = None
         req.tool_choice = None
     else:
@@ -512,6 +542,11 @@ async def run_chat_runtime(
                     temperature=req.temperature,
                     top_p=req.top_p,
                     max_tokens=req.max_tokens,
+                    max_completion_tokens=getattr(req, "max_completion_tokens", None),
+                    stop=getattr(req, "stop", None),
+                    response_format=getattr(req, "response_format", None),
+                    reasoning_effort=getattr(req, "reasoning_effort", None),
+                    reasoning=getattr(req, "reasoning", None),
                     user=user_id,
                     stream=False,
                 ),
@@ -530,7 +565,9 @@ async def run_chat_runtime(
             yield {"type": "done"}
             return
 
-        logger.info("Sidecar request completed: memory extraction is disabled and will not run.")
+        logger.info(
+            "Sidecar request completed: memory extraction is disabled and will not run."
+        )
         yield {"type": "final", "payload": upstream_resp}
         yield {"type": "done"}
         return
@@ -560,13 +597,20 @@ async def run_chat_runtime(
                 temperature=req.temperature,
                 top_p=req.top_p,
                 max_tokens=req.max_tokens,
+                max_completion_tokens=getattr(req, "max_completion_tokens", None),
+                stop=getattr(req, "stop", None),
+                response_format=getattr(req, "response_format", None),
+                reasoning_effort=getattr(req, "reasoning_effort", None),
+                reasoning=getattr(req, "reasoning", None),
                 user=user_id,
                 stream=False,
             )
             if advertise_tools:
                 upstream_kwargs.update({"tools": openai_tools, "tool_choice": "auto"})
 
-            upstream_resp = await chat_upstream(ChatRequest(**upstream_kwargs), req_id=req_id)
+            upstream_resp = await chat_upstream(
+                ChatRequest(**upstream_kwargs), req_id=req_id
+            )
         except Exception as e:
             logger.exception("Non-streaming upstream failed (runtime)")
             err = ChatErrorMessage(
@@ -633,15 +677,23 @@ async def run_chat_runtime(
                 args_str = fn.get("arguments") or "{}"
 
                 try:
-                    args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+                    args = (
+                        json.loads(args_str)
+                        if isinstance(args_str, str)
+                        else (args_str or {})
+                    )
                 except Exception:
                     args = {}
 
                 try:
                     tool_result = await executor.execute(name, args)
                 except Exception as e:
-                    logger.exception(f"Tool execution raised name={name} call_id={call_id}")
-                    tool_result = ToolResult(result=None, is_error=True, error=str(e), raw=None)
+                    logger.exception(
+                        f"Tool execution raised name={name} call_id={call_id}"
+                    )
+                    tool_result = ToolResult(
+                        result=None, is_error=True, error=str(e), raw=None
+                    )
 
                 # Append tool message for the model to consume
                 content = _tool_result_to_content(tool_result)

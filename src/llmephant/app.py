@@ -3,7 +3,11 @@ from fastapi import FastAPI, APIRouter
 import httpx
 from llmephant.core.logger import setup_logger
 from llmephant.core.settings import settings
-from llmephant.core.tooling_config import ToolingConfigError, load_tooling_config, tooling_snapshot
+from llmephant.core.tooling_config import (
+    ToolingConfigError,
+    load_tooling_config,
+    tooling_snapshot,
+)
 from llmephant.routers import chat_router, memory_router, models_router, health_router
 from llmephant.services.embedding_service import init_embedder
 from llmephant.repositories.qdrant_repository import init_qdrant
@@ -39,7 +43,9 @@ async def lifespan(app: FastAPI):
             logger.info("Tooling config loaded: %s", tooling_snapshot(cfg))
 
             if not cfg.enabled:
-                logger.info("Tooling disabled by config (enabled=false); continuing without tools")
+                logger.info(
+                    "Tooling disabled by config (enabled=false); continuing without tools"
+                )
             else:
                 for server in cfg.mcp_servers:
                     if not server.enabled:
@@ -51,8 +57,12 @@ async def lifespan(app: FastAPI):
                         tool_name_prefix=server.tool_name_prefix,
                         headers=server.headers,
                         timeout_s=server.timeout_s,
-                        allow_tools=set(server.allow_tools) if server.allow_tools else None,
-                        deny_tools=set(server.deny_tools) if server.deny_tools else None,
+                        allow_tools=set(server.allow_tools)
+                        if server.allow_tools
+                        else None,
+                        deny_tools=set(server.deny_tools)
+                        if server.deny_tools
+                        else None,
                     )
                     app.state.tool_providers.append(provider)
 
@@ -66,7 +76,9 @@ async def lifespan(app: FastAPI):
                         )
 
                     except httpx.ConnectError as e:
-                        logger.warning(f"Tool server unreachable; skipping provider='{provider.name}' err='{e}'")
+                        logger.warning(
+                            f"Tool server unreachable; skipping provider='{provider.name}' err='{e}'"
+                        )
 
                     except Exception as e:
                         tooling_errors[server.name] = str(e)
@@ -90,11 +102,15 @@ async def lifespan(app: FastAPI):
 
         except ToolingConfigError as e:
             app.state.tooling_init_error = {"config": str(e)}
-            logger.exception("⚠️ Tooling config invalid/unavailable; continuing without tools")
+            logger.exception(
+                "⚠️ Tooling config invalid/unavailable; continuing without tools"
+            )
 
         except Exception as e:
             app.state.tooling_init_error = {"startup": str(e)}
-            logger.exception("⚠️ Tooling initialization failed; continuing without tools")
+            logger.exception(
+                "⚠️ Tooling initialization failed; continuing without tools"
+            )
 
         yield
         logger.info("🐘🛑 Shutting down.")

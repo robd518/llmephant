@@ -151,7 +151,9 @@ class ToolingConfig(BaseModel):
                 continue
 
             if s.name in names:
-                raise ValueError(f"Duplicate MCP server name among enabled servers: {s.name}")
+                raise ValueError(
+                    f"Duplicate MCP server name among enabled servers: {s.name}"
+                )
             names.add(s.name)
 
             if s.tool_name_prefix in prefixes:

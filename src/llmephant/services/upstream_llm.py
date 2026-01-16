@@ -40,6 +40,8 @@ def _safe_payload_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         "stream": bool(g("stream")) if g("stream") is not None else None,
         "temperature": g("temperature"),
         "max_tokens": g("max_tokens"),
+        "has_token_cap": (g("max_tokens") is not None)
+        or (g("max_completion_tokens") is not None),
         "max_completion_tokens": g("max_completion_tokens"),
         "top_p": g("top_p"),
         "presence_penalty": g("presence_penalty"),
@@ -58,7 +60,11 @@ def _safe_payload_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Sanitize stream_options: only keep include_usage if present.
     so = preview.get("stream_options")
     if isinstance(so, dict):
-        preview["stream_options"] = {"include_usage": so.get("include_usage")} if "include_usage" in so else None
+        preview["stream_options"] = (
+            {"include_usage": so.get("include_usage")}
+            if "include_usage" in so
+            else None
+        )
 
     # Drop Nones to keep logs compact.
     return {k: v for k, v in preview.items() if v is not None}
@@ -79,13 +85,17 @@ def _safe_usage_preview(usage: Any) -> Optional[Dict[str, Any]]:
     return out or None
 
 
-def _log_upstream_payload(prefix: str, payload: Dict[str, Any], req_id: Optional[str] = None) -> None:
+def _log_upstream_payload(
+    prefix: str, payload: Dict[str, Any], req_id: Optional[str] = None
+) -> None:
     """Log a consistent, safe payload preview."""
     try:
         preview = _safe_payload_preview(payload)
         if req_id:
             preview = {"req_id": req_id, **preview}
-        logger.info("%s %s", prefix, json.dumps(preview, ensure_ascii=False, sort_keys=True))
+        logger.info(
+            "%s %s", prefix, json.dumps(preview, ensure_ascii=False, sort_keys=True)
+        )
     except Exception as e:
         logger.warning("%s <failed to build payload preview: %s>", prefix, e)
 
@@ -101,7 +111,9 @@ async def chat_upstream(req: ChatRequest, *, req_id: Optional[str] = None):
 
     async with httpx.AsyncClient(base_url=UPSTREAM_OPENAI_BASE, timeout=60.0) as client:
         try:
-            logger.info("POST %s/chat/completions", UPSTREAM_OPENAI_BASE)
+            logger.info(
+                "POST %s/chat/completions req_id=%s", UPSTREAM_OPENAI_BASE, req_id
+            )
             t0 = time.perf_counter()
             resp = await client.post("/chat/completions", json=payload)
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -110,7 +122,11 @@ async def chat_upstream(req: ChatRequest, *, req_id: Optional[str] = None):
             finish_reason = None
             try:
                 choices = data.get("choices") or []
-                if choices and isinstance(choices, list) and isinstance(choices[0], dict):
+                if (
+                    choices
+                    and isinstance(choices, list)
+                    and isinstance(choices[0], dict)
+                ):
                     finish_reason = choices[0].get("finish_reason")
             except Exception:
                 finish_reason = None
@@ -130,14 +146,26 @@ async def chat_upstream(req: ChatRequest, *, req_id: Optional[str] = None):
                 snippet = (e.response.text or "")[:800]
             except Exception:
                 snippet = "<unavailable>"
-            logger.error("Upstream returned HTTP error status=%s body_snippet=%r", e.response.status_code, snippet)
+            logger.error(
+                "Upstream returned HTTP error req_id=%s status=%s body_snippet=%r",
+                req_id,
+                e.response.status_code,
+                snippet,
+            )
             raise
         except Exception as e:
-            logger.error("Unexpected upstream error type=%s err=%s", type(e).__name__, e)
+            logger.error(
+                "Unexpected upstream error req_id=%s type=%s err=%s",
+                req_id,
+                type(e).__name__,
+                e,
+            )
             raise
 
 
-async def chat_upstream_stream(req: ChatRequest, *, req_id: Optional[str] = None) -> AsyncIterator[Dict[str, Any]]:
+async def chat_upstream_stream(
+    req: ChatRequest, *, req_id: Optional[str] = None
+) -> AsyncIterator[Dict[str, Any]]:
     """Stream an OpenAI-style SSE response and yield parsed JSON frames.
 
     This is intentionally lightweight (close to the original behavior), but includes
@@ -173,7 +201,10 @@ async def chat_upstream_stream(req: ChatRequest, *, req_id: Optional[str] = None
                     except Exception:
                         snippet = "<unavailable>"
                     logger.error(
-                        f"Upstream returned HTTP error {e.response.status_code}: {snippet}"
+                        "Upstream returned HTTP error req_id=%s status=%s snippet=%r",
+                        req_id,
+                        e.response.status_code,
+                        snippet,
                     )
                     raise
 
@@ -209,7 +240,11 @@ async def chat_upstream_stream(req: ChatRequest, *, req_id: Optional[str] = None
                     parsed_frames += 1
                     try:
                         choices = parsed.get("choices") or []
-                        if choices and isinstance(choices, list) and isinstance(choices[0], dict):
+                        if (
+                            choices
+                            and isinstance(choices, list)
+                            and isinstance(choices[0], dict)
+                        ):
                             fr = choices[0].get("finish_reason")
                             if fr:
                                 last_finish_reason = fr
@@ -234,7 +269,9 @@ async def chat_upstream_stream(req: ChatRequest, *, req_id: Optional[str] = None
             )
             raise
         finally:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0 if 't0' in locals() else None
+            elapsed_ms = (
+                (time.perf_counter() - t0) * 1000.0 if "t0" in locals() else None
+            )
             if elapsed_ms is not None:
                 logger.info(
                     "Upstream stream finished req_id=%s lines_seen=%s data_lines=%s parsed_frames=%s elapsed_ms=%.1f finish_reason=%s usage=%s",
@@ -274,7 +311,9 @@ async def list_models(*, req_id: Optional[str] = None) -> Dict:
 
 async def check_upstream_health(client=None, *, req_id: Optional[str] = None) -> bool:
     logger.info("Checking upstream LLM health. req_id=%s", req_id)
-    async with (client or httpx.AsyncClient(base_url=UPSTREAM_OPENAI_BASE, timeout=3)) as c:
+    async with client or httpx.AsyncClient(
+        base_url=UPSTREAM_OPENAI_BASE, timeout=3
+    ) as c:
         resp = await c.get("/models")
         resp.raise_for_status()
         return resp.status_code == 200

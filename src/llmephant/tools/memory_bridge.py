@@ -60,11 +60,15 @@ def _summarize_value(value: Any) -> Dict[str, Any]:
     if isinstance(value, dict):
         keys = list(value.keys())
         top_keys = [str(k) for k in keys[:MAX_KEY_PREVIEW]]
-        summary.update({
-            "n_keys": len(keys),
-            "top_keys": top_keys,
-        })
-        basis = _safe_json_dumps({"kind": "dict", "n_keys": len(keys), "top_keys": top_keys})
+        summary.update(
+            {
+                "n_keys": len(keys),
+                "top_keys": top_keys,
+            }
+        )
+        basis = _safe_json_dumps(
+            {"kind": "dict", "n_keys": len(keys), "top_keys": top_keys}
+        )
         if basis is None:
             basis = f"dict:{len(keys)}:{','.join(top_keys)}"
 

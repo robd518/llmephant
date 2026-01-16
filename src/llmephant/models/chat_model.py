@@ -11,6 +11,7 @@ class ChatMessage(BaseModel):
 
     Backward compatible: existing callers using only (role, content) still work.
     """
+
     role: str
     content: Optional[str] = None
 
@@ -30,6 +31,20 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     top_p: float = 1.0
     max_tokens: Optional[int] = None
+
+    # Some backends support an alternate token cap name.
+    max_completion_tokens: Optional[int] = None
+
+    # Optional structured output controls (OpenAI-style)
+    response_format: Optional[Dict[str, Any]] = None
+
+    # Optional stop sequences
+    stop: Optional[Any] = None
+
+    # Optional reasoning controls (backend-dependent)
+    reasoning_effort: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None
+
     user: Optional[str] = None
     stream: bool = False
     stream_options: Optional[Dict[str, Any]] = None

@@ -1,5 +1,6 @@
 import re
 
+
 def normalize_fact(text: str) -> str:
     """
     Normalize a fact string for deduplication and clarity:
