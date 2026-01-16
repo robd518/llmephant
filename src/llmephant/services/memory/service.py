@@ -1,5 +1,4 @@
 import json
-import re
 from typing import Any, Dict, List, Optional, TypedDict
 
 from llmephant.core.settings import settings
@@ -7,6 +6,12 @@ from llmephant.core.logger import setup_logger
 from llmephant.models.chat_model import ChatRequest, ChatMessage
 from llmephant.repositories.qdrant_repository import qdrant_search, qdrant_upsert
 from llmephant.services.embedding_service import embed_texts
+from .json_utils import (
+    extract_json_object,
+    get_finish_reason,
+    strip_code_fences,
+)
+from .prompts import DISTILL_PROMPT, VERIFY_PROMPT, EXTRACT_PROMPT
 from llmephant.services.normalization import normalize_fact
 from llmephant.services.upstream_llm import chat_upstream
 
@@ -109,7 +114,9 @@ def search_relevant_workspace_memories(user_id: str, query: str) -> List[MemoryH
     if not query or not query.strip():
         return []
 
-    query_vec = embed_texts([query])[0]
+    query_vec = _try_embed_query(user_id, query, purpose="recall.workspace")
+    if query_vec is None:
+        return []
     threshold = settings.MEMORY_SIMILARITY_THRESHOLD
     raw = qdrant_search(_workspace_namespace_user_id(user_id), query_vec, top_k=8)
 
@@ -196,30 +203,7 @@ async def _verify_user_memory_items(
     convo = [
         ChatMessage(
             role="system",
-            content=(
-                "You are a memory verification assistant.\n"
-                "You will be given a USER transcript (USER messages only) and a list of candidate memory items.\n"
-                "Your job is to return ONLY the items that should be STORED as durable memories.\n\n"
-                "Rules:\n"
-                "- Only keep items that are explicitly supported by the transcript evidence.\n"
-                "- Drop instructions/requests/tasks/to-dos, even if rewritten as a statement (e.g., 'User requires a narrative summary...').\n"
-                "- Drop ephemeral or one-off statements unless they are useful as short-lived workspace context.\n"
-                "- profile: only long-term durable personal facts/preferences explicitly stated by the user.\n"
-                "- workspace: current project/tools/work context that will likely remain useful for at least days/weeks.\n"
-                "- Do NOT store 'how to respond' preferences unless the user explicitly states it as a durable preference.\n"
-                "- Evidence MUST be a verbatim substring from the transcript.\n"
-                "- Return ONLY valid JSON (no markdown, no prose).\n\n"
-                "JSON format:\n"
-                "{\n"
-                '  "items": [\n'
-                "    {\n"
-                '      "text": string,\n'
-                '      "category": "profile"|"workspace",\n'
-                '      "evidence": string\n'
-                "    }, ...\n"
-                "  ]\n"
-                "}"
-            ),
+            content=VERIFY_PROMPT,
         ),
         ChatMessage(
             role="user",
@@ -246,7 +230,7 @@ async def _verify_user_memory_items(
 
     resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
 
-    finish_reason = _get_finish_reason(resp)
+    finish_reason = get_finish_reason(resp)
 
     if not isinstance(resp, dict) or "choices" not in resp or "error" in resp:
         _log_memory(
@@ -279,7 +263,7 @@ async def _verify_user_memory_items(
             req_id=req_id,
         )
 
-    obj = _extract_json_object(content)
+    obj = extract_json_object(content)
     if obj is None:
         _log_memory(
             "verify.skip.parse_failed",
@@ -291,7 +275,7 @@ async def _verify_user_memory_items(
         )
         parse_err: Optional[str] = None
         try:
-            json.loads(_strip_code_fences(content))
+            json.loads(strip_code_fences(content))
         except Exception as e:
             parse_err = repr(e)
 
@@ -369,7 +353,9 @@ def _evidence_is_verbatim(evidence: str, transcript: str) -> bool:
 def search_relevant_memories(user_id: str, query: str) -> List[MemoryHit]:
     if not query or not query.strip():
         return []
-    query_vec = embed_texts([query])[0]
+    query_vec = _try_embed_query(user_id, query, purpose="recall.profile")
+    if query_vec is None:
+        return []
     threshold = settings.MEMORY_SIMILARITY_THRESHOLD
     raw = qdrant_search(user_id, query_vec, top_k=8)
     memories: List[MemoryHit] = []
@@ -392,12 +378,32 @@ def _analysis_namespace_user_id(user_id: str) -> str:
     return f"{user_id}::analysis"
 
 
+def _try_embed_query(user_id: str, query: str, *, purpose: str) -> Optional[List[float]]:
+    """Best-effort embed of a single query. Returns None if embeddings are unavailable."""
+    try:
+        return embed_texts([query])[0]
+    except Exception as e:
+        # Memory is optional enrichment; never take down chat because embeddings are unavailable.
+        _log_memory(
+            "embed.unavailable",
+            user_id=user_id,
+            purpose=purpose,
+            err=type(e).__name__,
+        )
+        logger.warning(
+            f"Embeddings unavailable for purpose={purpose!r}; skipping memory operation. err={type(e).__name__}: {e}"
+        )
+        return None
+
+
 def search_relevant_analysis_memories(user_id: str, query: str) -> List[MemoryHit]:
     """Search investigation notes (analysis namespace) relevant to the current query."""
     if not query or not query.strip():
         return []
 
-    query_vec = embed_texts([query])[0]
+    query_vec = _try_embed_query(user_id, query, purpose="recall.analysis")
+    if query_vec is None:
+        return []
     threshold = settings.MEMORY_SIMILARITY_THRESHOLD
     raw = qdrant_search(_analysis_namespace_user_id(user_id), query_vec, top_k=8)
 
@@ -454,176 +460,6 @@ def augment_messages_with_analysis_memories(
         ),
     )
     return [prefix, *messages]
-
-
-def _strip_code_fences(text: str) -> str:
-    """
-    Remove surrounding ``` or ```json fences if present.
-    """
-    t = (text or "").strip()
-    if not t.startswith("```"):
-        return t
-
-    # drop the first fence line (``` or ```json)
-    first_nl = t.find("\n")
-    if first_nl != -1:
-        t = t[first_nl + 1 :]
-    # drop trailing fence
-    if t.rstrip().endswith("```"):
-        t = t.rstrip()[:-3]
-    return t.strip()
-
-
-def _get_finish_reason(resp: Any) -> Optional[str]:
-    """Best-effort extraction of choice.finish_reason from an upstream response."""
-    if not isinstance(resp, dict):
-        return None
-    choices = resp.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return None
-    c0 = choices[0]
-    if isinstance(c0, dict):
-        fr = c0.get("finish_reason")
-        return fr if isinstance(fr, str) else None
-    return None
-
-
-def _repair_json_common(s: str) -> str:
-    """Best-effort repair for common LLM JSON mistakes.
-
-    Repairs (string/escape-aware):
-      - Trailing commas before `}` or `]`.
-      - Normalizes unicode line separators that can break JSON parsing.
-      - Strips UTF-8 BOM if present.
-
-    This is intentionally conservative: if no obvious repair is needed, returns input unchanged.
-    """
-    if not s:
-        return s
-
-    # Strip BOM
-    s = s.lstrip("\ufeff")
-
-    # Normalize line separators
-    s = s.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-
-    # Mask out characters inside JSON strings so we don't remove commas inside strings.
-    in_string = False
-    escape = False
-    mask_chars: List[str] = []
-
-    for ch in s:
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            mask_chars.append("X")
-            continue
-
-        if ch == '"':
-            in_string = True
-            mask_chars.append("X")
-            continue
-
-        mask_chars.append(ch)
-
-    masked = "".join(mask_chars)
-
-    # Remove commas followed by only whitespace and then a closing brace/bracket.
-    comma_positions = [m.start() for m in re.finditer(r",(?=\s*[}\]])", masked)]
-    if not comma_positions:
-        return s
-
-    chars = list(s)
-    for idx in reversed(comma_positions):
-        chars[idx] = ""
-    return "".join(chars)
-
-
-def _extract_json_object(text: str) -> Optional[dict]:
-    """Extract the first valid JSON object from `text`.
-
-    Best-effort extraction that is robust to:
-      - raw JSON object
-      - JSON wrapped in code fences
-      - extra prose before/after
-
-    Uses a balanced-brace scanner that is string/escape aware (so braces inside strings
-    do not affect nesting depth).
-    """
-    if not text:
-        return None
-
-    candidate = _strip_code_fences(text)
-
-    # Fast path: whole-string JSON
-    try:
-        obj = json.loads(candidate)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        repaired = _repair_json_common(candidate)
-        if repaired != candidate:
-            try:
-                obj = json.loads(repaired)
-                return obj if isinstance(obj, dict) else None
-            except Exception:
-                pass
-
-    s = candidate
-
-    start: Optional[int] = None
-    depth = 0
-    in_string = False
-    escape = False
-
-    for i, ch in enumerate(s):
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-
-        # Not currently in a string
-        if ch == '"':
-            in_string = True
-            continue
-
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-            continue
-
-        if ch == "}":
-            if depth == 0:
-                continue
-            depth -= 1
-            if depth == 0 and start is not None:
-                chunk = s[start : i + 1]
-                try:
-                    obj = json.loads(chunk)
-                    return obj if isinstance(obj, dict) else None
-                except Exception:
-                    repaired = _repair_json_common(chunk)
-                    if repaired != chunk:
-                        try:
-                            obj = json.loads(repaired)
-                            return obj if isinstance(obj, dict) else None
-                        except Exception:
-                            pass
-                    # Keep scanning: there may be another object later.
-                    start = None
-                    continue
-
-    return None
 
 
 def _collect_tool_names(messages: List[ChatMessage]) -> List[str]:
@@ -692,6 +528,33 @@ def _filter_verbatim_observables(observables: List[str], source_text: str) -> Li
     return final
 
 
+def _dedupe_for_upsert(
+    namespace_user_id: str,
+    texts: List[str],
+) -> tuple[List[str], List[List[float]], int]:
+    """Return (texts_to_insert, vecs_to_insert, skipped) after similarity-based dedupe."""
+
+    try:
+        vecs = embed_texts(texts)
+    except Exception as e:
+        raise RuntimeError("Embeddings unavailable") from e
+    threshold = settings.MEMORY_SIMILARITY_THRESHOLD
+
+    to_insert_texts: List[str] = []
+    to_insert_vecs: List[List[float]] = []
+    skipped = 0
+
+    for text, vec in zip(texts, vecs):
+        existing = qdrant_search(namespace_user_id, vec, top_k=1)
+        if existing and float(existing[0].get("score", 0.0) or 0.0) >= threshold:
+            skipped += 1
+            continue
+        to_insert_texts.append(text)
+        to_insert_vecs.append(vec)
+
+    return to_insert_texts, to_insert_vecs, skipped
+
+
 def store_investigation_memories(user_id: str, notes: List[str]) -> int:
     """Store investigation notes in a separate namespace."""
     cleaned = [normalize_fact(n) for n in notes if isinstance(n, str) and n.strip()]
@@ -699,20 +562,12 @@ def store_investigation_memories(user_id: str, notes: List[str]) -> int:
         return 0
 
     ns_user_id = _analysis_namespace_user_id(user_id)
-    vecs = embed_texts(cleaned)
-    threshold = settings.MEMORY_SIMILARITY_THRESHOLD
-
-    to_insert_texts: List[str] = []
-    to_insert_vecs: List[List[float]] = []
-    skipped = 0
-
-    for text, vec in zip(cleaned, vecs):
-        existing = qdrant_search(ns_user_id, vec, top_k=1)
-        if existing and float(existing[0].get("score", 0.0) or 0.0) >= threshold:
-            skipped += 1
-            continue
-        to_insert_texts.append(text)
-        to_insert_vecs.append(vec)
+    try:
+        to_insert_texts, to_insert_vecs, skipped = _dedupe_for_upsert(ns_user_id, cleaned)
+    except RuntimeError as e:
+        _log_memory("analysis.store.skip.embed_unavailable", user_id=user_id)
+        logger.warning(f"Skipping investigation memory store: {e}")
+        return 0
 
     if not to_insert_texts:
         _log_memory("analysis.store.none_deduped", user_id=user_id, skipped=skipped)
@@ -767,30 +622,7 @@ async def _distill_investigation_memories(
     convo = [
         ChatMessage(
             role="system",
-            content=(
-                "You are a memory distiller for cybersecurity investigations.\n"
-                "Given the USER question, the ASSISTANT final answer, and the tool names used, decide whether to store durable investigation notes for future recall.\n\n"
-                "Constraints:\n"
-                "- Do NOT store personal profile facts about the user (preferences, identity, habits).\n"
-                "- Prefer durable investigation takeaways: key findings, hypotheses, procedures, IOCs/observables mentioned.\n"
-                "- Keep memory texts concise (<= 300 characters each).\n"
-                "- Include at most 12 observables and 8 tags per memory.\n"
-                "- If nothing is worth remembering, set store=false and return an empty list.\n"
-                "- Observables MUST be copied exactly from the provided text (verbatim substrings).\n"
-                '- If you cannot fit valid JSON, return {"store": false, "memories": []}.\n'
-                "- Return ONLY valid JSON (no markdown, no prose).\n\n"
-                "JSON format:\n"
-                "{\n"
-                '  "store": true|false,\n'
-                '  "memories": [\n'
-                "    {\n"
-                '      "text": string,\n'
-                '      "observables": [string, ...],\n'
-                '      "tags": [string, ...]\n'
-                "    }, ...\n"
-                "  ]\n"
-                "}\n"
-            ),
+            content=DISTILL_PROMPT,
         ),
         ChatMessage(
             role="user",
@@ -809,7 +641,7 @@ async def _distill_investigation_memories(
     )
 
     resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
-    finish_reason = _get_finish_reason(resp)
+    finish_reason = get_finish_reason(resp)
 
     if not isinstance(resp, dict) or "choices" not in resp or "error" in resp:
         _log_memory(
@@ -842,7 +674,7 @@ async def _distill_investigation_memories(
             req_id=req_id,
         )
 
-    obj = _extract_json_object(content)
+    obj = extract_json_object(content)
     if obj is None:
         _log_memory(
             "analysis.skip.parse_failed",
@@ -854,7 +686,7 @@ async def _distill_investigation_memories(
         )
         parse_err: Optional[str] = None
         try:
-            json.loads(_strip_code_fences(content))
+            json.loads(strip_code_fences(content))
         except Exception as e:
             parse_err = repr(e)
 
@@ -1053,44 +885,7 @@ async def extract_and_store_memory(
     convo = [
         ChatMessage(
             role="system",
-            content=(
-                "You are a memory extraction assistant.\n"
-                "Extract stable, useful facts stated by the USER (from USER messages only).\n\n"
-                "You must provide verbatim evidence for each item: the evidence must be an exact substring from the USER transcript.\n\n"
-                "Categories:\n"
-                "- profile: durable personal preferences/identity/long-term habits\n"
-                "- workspace: current projects/tools/work context (useful, but time-varying)\n\n"
-                "Rules:\n"
-                "- Only include facts explicitly supported by the USER transcript (no inference).\n"
-                "- NEVER store instructions, requests, tasks, or to-do items.\n"
-                "  - If the user is telling the assistant to DO something, that is not a memory.\n"
-                "- NEVER store 'how to respond' preferences unless the user states it as a durable preference (e.g., 'I prefer X in general').\n"
-                "- Profile is extremely strict: only durable facts likely true in 30+ days (identity/role/preferences explicitly stated).\n"
-                "- If a fact is situational (testing, this run, right now), classify as workspace or drop it.\n"
-                "- Write items in third person, as declarative statements (not commands).\n"
-                "- Keep items short (<= 140 chars each).\n"
-                "- Evidence MUST be a verbatim substring from USER transcript.\n"
-                "- Respond ONLY as valid JSON (no markdown, no prose).\n"
-                "\n"
-                "Examples (DO NOT STORE):\n"
-                '- "Re-run the last tool" (task)\n'
-                '- "Generate a narrative summary" (task)\n'
-                '- "Redo that last analysis but..." (task)\n'
-                "\n"
-                "Examples (OK to store as workspace):\n"
-                '- "User is testing a memory service locally in an isolated environment."\n'
-                "JSON format:\n"
-                "{\n"
-                '  "confidence": float between 0 and 1,\n'
-                '  "items": [\n'
-                "    {\n"
-                '      "text": string,\n'
-                '      "category": "profile"|"workspace",\n'
-                '      "evidence": string\n'
-                "    }, ...\n"
-                "  ]\n"
-                "}"
-            ),
+            content=EXTRACT_PROMPT,
         ),
         ChatMessage(role="user", content=transcript),
     ]
@@ -1105,7 +900,7 @@ async def extract_and_store_memory(
     )
 
     resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
-    finish_reason = _get_finish_reason(resp)
+    finish_reason = get_finish_reason(resp)
 
     if not isinstance(resp, dict):
         _log_memory(
@@ -1164,7 +959,7 @@ async def extract_and_store_memory(
                 req_id=req_id,
             )
 
-        obj = _extract_json_object(content)
+        obj = extract_json_object(content)
         if obj is None:
             _log_memory(
                 "extract.skip.parse_failed",
@@ -1176,7 +971,7 @@ async def extract_and_store_memory(
             )
             parse_err: Optional[str] = None
             try:
-                json.loads(_strip_code_fences(content))
+                json.loads(strip_code_fences(content))
             except Exception as e:
                 parse_err = repr(e)
 
@@ -1362,20 +1157,12 @@ def store_facts(user_id: str, facts: List[str]) -> int:
     if not cleaned:
         return 0
 
-    vecs = embed_texts(cleaned)
-    threshold = settings.MEMORY_SIMILARITY_THRESHOLD
-
-    to_insert_texts: List[str] = []
-    to_insert_vecs: List[List[float]] = []
-    skipped = 0
-
-    for text, vec in zip(cleaned, vecs):
-        existing = qdrant_search(user_id, vec, top_k=1)
-        if existing and float(existing[0].get("score", 0.0) or 0.0) >= threshold:
-            skipped += 1
-            continue
-        to_insert_texts.append(text)
-        to_insert_vecs.append(vec)
+    try:
+        to_insert_texts, to_insert_vecs, skipped = _dedupe_for_upsert(user_id, cleaned)
+    except RuntimeError as e:
+        _log_memory("store.skip.embed_unavailable", user_id=user_id)
+        logger.warning(f"Skipping user memory store: {e}")
+        return 0
 
     if not to_insert_texts:
         _log_memory("store.none_deduped", user_id=user_id, skipped=skipped)
@@ -1394,20 +1181,12 @@ def store_workspace_facts(user_id: str, facts: List[str]) -> int:
         return 0
 
     ns_user_id = _workspace_namespace_user_id(user_id)
-    vecs = embed_texts(cleaned)
-    threshold = settings.MEMORY_SIMILARITY_THRESHOLD
-
-    to_insert_texts: List[str] = []
-    to_insert_vecs: List[List[float]] = []
-    skipped = 0
-
-    for text, vec in zip(cleaned, vecs):
-        existing = qdrant_search(ns_user_id, vec, top_k=1)
-        if existing and float(existing[0].get("score", 0.0) or 0.0) >= threshold:
-            skipped += 1
-            continue
-        to_insert_texts.append(text)
-        to_insert_vecs.append(vec)
+    try:
+        to_insert_texts, to_insert_vecs, skipped = _dedupe_for_upsert(ns_user_id, cleaned)
+    except RuntimeError as e:
+        _log_memory("workspace.store.skip.embed_unavailable", user_id=user_id)
+        logger.warning(f"Skipping workspace memory store: {e}")
+        return 0
 
     if not to_insert_texts:
         _log_memory("workspace.store.none_deduped", user_id=user_id, skipped=skipped)

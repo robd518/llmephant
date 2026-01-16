@@ -6,7 +6,7 @@ from llmephant.core.logger import setup_logger
 from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMessage
 from llmephant.models.chat_model import ChatMessage
 from llmephant.tools.executor import ToolResult
-from llmephant.services.memory_service import (
+from llmephant.services.memory import (
     augment_messages_with_analysis_memories,
     augment_messages_with_memory,
     augment_messages_with_workspace_memories,
@@ -134,6 +134,7 @@ def _apply_memory_context(
     return out
 
 
+
 def _accumulate_tool_call_deltas(
     acc: Dict[int, Dict[str, Any]],
     deltas: List[Dict[str, Any]],
@@ -166,6 +167,41 @@ def _accumulate_tool_call_deltas(
             cur["function"]["name"] = fn_delta.get("name")
         if fn_delta.get("arguments"):
             cur["function"]["arguments"] += fn_delta.get("arguments")
+
+
+# --- Tool call helpers ---
+def _summarize_tool_calls(tool_calls_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a sanitized, compact summary of tool calls for logging."""
+    assembled_summary: List[Dict[str, Any]] = []
+    for tc in tool_calls_raw or []:
+        fn = tc.get("function") or {}
+        args_preview_src = fn.get("arguments") or ""
+        preview = (
+            args_preview_src[:60]
+            if isinstance(args_preview_src, str)
+            else str(args_preview_src)[:60]
+        )
+        if isinstance(preview, str):
+            preview = preview.replace("\n", "\\n").replace("\r", "\\r")
+
+        assembled_summary.append(
+            {
+                "name": fn.get("name"),
+                "args_len": len(args_preview_src)
+                if isinstance(args_preview_src, str)
+                else len(str(args_preview_src)),
+                "has_id": bool(tc.get("id")),
+                "args_preview": repr(preview),
+            }
+        )
+    return assembled_summary
+
+
+def _ensure_tool_call_ids(tool_calls_raw: List[Dict[str, Any]], *, prefix: str) -> None:
+    """Ensure each tool call has an id (required for tool responses)."""
+    for i, tc in enumerate(tool_calls_raw or []):
+        if not tc.get("id"):
+            tc["id"] = f"{prefix}_{i}"
 
 
 async def _finalize_completion(
@@ -391,36 +427,11 @@ async def run_chat_runtime_stream(
 
             tool_calls_raw = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
 
-            assembled_summary = []
-            for tc in tool_calls_raw:
-                fn = tc.get("function") or {}
-                args_preview_src = fn.get("arguments") or ""
-                preview = (
-                    args_preview_src[:60]
-                    if isinstance(args_preview_src, str)
-                    else str(args_preview_src)[:60]
-                )
-                if isinstance(preview, str):
-                    preview = preview.replace("\n", "\\n").replace("\r", "\\r")
-
-                assembled_summary.append(
-                    {
-                        "name": fn.get("name"),
-                        "args_len": len(args_preview_src)
-                        if isinstance(args_preview_src, str)
-                        else len(str(args_preview_src)),
-                        "has_id": bool(tc.get("id")),
-                        "args_preview": repr(preview),
-                    }
-                )
             logger.info(
-                f"[tool-stream] assembled tool_calls (iteration={iteration}): {assembled_summary}"
+                f"[tool-stream] assembled tool_calls (iteration={iteration}): {_summarize_tool_calls(tool_calls_raw)}"
             )
 
-            # Ensure each tool call has an id for tool responses.
-            for i, tc in enumerate(tool_calls_raw):
-                if not tc.get("id"):
-                    tc["id"] = f"call_{iteration}_{i}"
+            _ensure_tool_call_ids(tool_calls_raw, prefix=f"call_{iteration}")
 
             # Append assistant message that requested the tool calls.
             req.messages.append(
@@ -647,7 +658,8 @@ async def run_chat_runtime(
 
         # If the model requested tools, execute them and continue the loop.
         if tool_calls_raw:
-            logger.info(f"Tool calls requested: {tool_calls_raw}")
+            logger.info(f"Tool calls requested: {_summarize_tool_calls(tool_calls_raw)}")
+            _ensure_tool_call_ids(tool_calls_raw, prefix=f"call_{iteration}")
             if iteration > max_tool_iterations:
                 err = ChatErrorMessage(
                     error=ErrorMessage(
