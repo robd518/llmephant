@@ -15,7 +15,23 @@ from .prompts import DISTILL_PROMPT, VERIFY_PROMPT, EXTRACT_PROMPT
 from llmephant.services.normalization import normalize_fact
 from llmephant.services.upstream_llm import chat_upstream
 
+
 logger = setup_logger(__name__)
+
+
+# --- Analysis distillation tuning (envelope schema) ---
+# These are intentionally module-level so they're easy to discover/tune.
+ANALYSIS_SALIENCE_THRESHOLD = 0.35  # Store if any memory salience >= this (0..1)
+ANALYSIS_CONFIDENCE_THRESHOLD = 0.60  # Store if any memory confidence >= this (0..1)
+
+# Hard caps to keep stored analysis notes compact (but keep enough context for recall).
+# ANALYSIS_SUMMARY_CAP aligns with the prompt's ~800-char summary constraint.
+ANALYSIS_MAX_NOTE_CHARS = 2200  # Max stored note length (after formatting)
+ANALYSIS_SUMMARY_CAP = 800  # Max chars taken from distiller summary
+ANALYSIS_MAX_OBSERVABLES = 20  # Max observables appended to the note
+ANALYSIS_MAX_TAGS = 10  # Max tags appended to the note
+ANALYSIS_MAX_NOTES = 3  # Max envelope items stored per run
+
 
 
 def _log_memory(event: str, **fields: Any) -> None:
@@ -24,6 +40,76 @@ def _log_memory(event: str, **fields: Any) -> None:
     # Keep logs compact and stable.
     parts = " ".join(f"{k}={safe[k]!r}" for k in sorted(safe.keys()))
     logger.info(f"memory.{event}" + (f" {parts}" if parts else ""))
+
+
+# --- Helper to summarize message shapes for diagnostics ---
+def _summarize_message_shapes(messages: List[ChatMessage], *, limit: int = 12) -> str:
+    """Return a compact, content-free summary of message roles/tool fields for diagnostics."""
+    if not messages:
+        return "(no messages)"
+
+    def _one(i: int, m: ChatMessage) -> str:
+        role = getattr(m, "role", None) or "?"
+        name = getattr(m, "name", None) or getattr(m, "tool_name", None) or ""
+        content = getattr(m, "content", None)
+        content_len = len(content) if isinstance(content, str) else 0
+        tc = getattr(m, "tool_calls", None)
+        tc_n = len(tc) if isinstance(tc, list) else 0
+        tci = getattr(m, "tool_call_id", None)
+        tci_flag = "1" if isinstance(tci, str) and tci else "0"
+        nm = f":{name}" if isinstance(name, str) and name else ""
+        return f"{i}:{role}{nm}(c={content_len},tc={tc_n},tci={tci_flag})"
+
+    # Head + tail so we can spot missing tool/assistant messages without leaking content.
+    if len(messages) <= limit:
+        parts = [_one(i, m) for i, m in enumerate(messages)]
+        return " | ".join(parts)
+
+    head_n = max(1, limit // 2)
+    tail_n = max(1, limit - head_n)
+    head = [_one(i, m) for i, m in enumerate(messages[:head_n])]
+    tail = [_one(len(messages) - tail_n + i, m) for i, m in enumerate(messages[-tail_n:])]
+    return " | ".join(head + [f"…(+{len(messages) - head_n - tail_n} msgs)…"] + tail)
+
+
+# --- Helper for sanitizing JSON-breaking control characters ---
+def _sanitize_json_control_chars(s: str) -> str:
+    """Best-effort removal of control characters that can break JSON parsing.
+
+    Some local models occasionally emit literal control characters (especially tabs)
+    inside JSON string values, which makes the entire response invalid JSON.
+
+    We keep this intentionally minimal: replace tabs with a space and drop other
+    C0 control chars except newlines/carriage returns.
+    """
+    if not isinstance(s, str) or not s:
+        return "" if s is None else str(s)
+
+    out: List[str] = []
+    for ch in s:
+        if ch == "\t":
+            out.append(" ")
+            continue
+        o = ord(ch)
+        if o < 32 and ch not in ("\n", "\r"):
+            # Drop other ASCII control chars (e.g., VT/FF) that can invalidate JSON.
+            continue
+        out.append(ch)
+
+    return "".join(out)
+
+
+# --- Helper for safe text clipping for logs ---
+def _clip_text(s: str, *, head: int = 240, tail: int = 240) -> str:
+    """Return a compact head/tail preview for diagnostics."""
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if not s:
+        return ""
+    if len(s) <= head + tail + 16:
+        return s
+    return f"{s[:head]}…<snip {len(s) - head - tail} chars>…{s[-tail:]}"
 
 
 # --- Added helpers for memory request knob plumbing ---
@@ -81,15 +167,6 @@ class MemoryHit(TypedDict):
     created_at: Optional[str]
 
 
-class AnalysisMemoryCandidate(TypedDict, total=False):
-    text: str
-    observables: List[str]
-    tags: List[str]
-
-
-class AnalysisDistillResult(TypedDict, total=False):
-    store: bool
-    memories: List[AnalysisMemoryCandidate]
 
 
 def handle_explicit_remember_request(user_id: str, last_msg: str) -> None:
@@ -192,6 +269,24 @@ async def _verify_user_memory_items(
 
     cand = candidates[:MAX_VERIFY_ITEMS]
 
+    cand_preview = [
+        {
+            "category": (c.get("category") if isinstance(c, dict) else None),
+            "text": ((c.get("text") or "")[:120] if isinstance(c, dict) else None),
+            "evidence_len": (len(c.get("evidence") or "") if isinstance(c, dict) else None),
+        }
+        for c in cand
+    ]
+
+    _log_memory(
+        "verify.candidates.preview",
+        user_id=user_id,
+        req_id=req_id,
+        model=model_name,
+        n_candidates=len(cand),
+        candidates=cand_preview,
+    )
+
     _log_memory(
         "verify.start",
         user_id=user_id,
@@ -224,8 +319,19 @@ async def _verify_user_memory_items(
             "model": model_name,
             "messages": convo,
             "temperature": 0.0,
+            "response_format": {"type": "json_object"},
             **knobs,
         }
+    )
+
+    # Log high-level input diagnostics before calling upstream.
+    _log_memory(
+        "verify.input",
+        user_id=user_id,
+        req_id=req_id,
+        model=model_name,
+        transcript_len=len(transcript),
+        n_candidates=len(cand),
     )
 
     resp = await chat_upstream(ChatRequest(**req_kwargs), req_id=req_id)
@@ -253,6 +359,16 @@ async def _verify_user_memory_items(
                 "User memory verifier returned empty message.content; attempting JSON parse from reasoning_content fallback."
             )
             content = rc
+
+    _log_memory(
+        "verify.raw.preview",
+        user_id=user_id,
+        model=model_name,
+        finish_reason=finish_reason,
+        content_len=len(content),
+        preview=_clip_text(content),
+        req_id=req_id,
+    )
 
     if finish_reason == "length":
         _log_memory(
@@ -289,12 +405,31 @@ async def _verify_user_memory_items(
         logger.error(log_msg)
         return []
 
+    _log_memory(
+        "verify.raw.parsed",
+        user_id=user_id,
+        model=model_name,
+        finish_reason=finish_reason,
+        keys=list(obj.keys()) if isinstance(obj, dict) else None,
+        n_items=(len(obj.get("items")) if isinstance(obj.get("items"), list) else None),
+        req_id=req_id,
+    )
+
     items = obj.get("items", [])
     if not isinstance(items, list):
         _log_memory(
             "verify.skip.bad_shape", user_id=user_id, model=model_name, req_id=req_id
         )
         return []
+
+    if not items:
+        _log_memory(
+            "verify.empty",
+            user_id=user_id,
+            model=model_name,
+            finish_reason=finish_reason,
+            req_id=req_id,
+        )
 
     kept: List[UserMemoryItem] = []
     dropped_bad_shape = 0
@@ -501,6 +636,54 @@ def _collect_tool_names(messages: List[ChatMessage]) -> List[str]:
     return out
 
 
+def _build_tool_transcript(
+    messages: List[ChatMessage],
+    *,
+    max_total_chars: int = 4000,
+    max_per_tool_chars: int = 1200,
+) -> str:
+    """Build a compact transcript of tool outputs for distillation input.
+
+    We include tool role message content so observables are preserved even when the assistant doesn't echo them.
+    This transcript is intended for the LLM distiller input (not for logs).
+    """
+
+    if not messages:
+        return ""
+
+    parts: List[str] = []
+    total = 0
+
+    for m in messages:
+        if getattr(m, "role", None) != "tool":
+            continue
+
+        name = getattr(m, "name", None) or getattr(m, "tool_name", None) or "tool"
+        content = getattr(m, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+
+        # Keep tool outputs single-line and bounded.
+        cleaned = content.replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+        if len(cleaned) > max_per_tool_chars:
+            cleaned = cleaned[: max_per_tool_chars - 1].rstrip() + "…"
+
+        chunk = f"[{name}] {cleaned}"
+        if total + len(chunk) + 1 > max_total_chars:
+            remaining = max_total_chars - total
+            if remaining <= 16:
+                break
+            chunk = chunk[: remaining - 1].rstrip() + "…"
+            parts.append(chunk)
+            total += len(chunk)
+            break
+
+        parts.append(chunk)
+        total += len(chunk) + 1
+
+    return "\n".join(parts).strip()
+
+
 def _filter_verbatim_observables(observables: List[str], source_text: str) -> List[str]:
     """Guardrail: keep only observables that appear verbatim in the provided text.
 
@@ -592,10 +775,9 @@ async def _distill_investigation_memories(
     req_id: Optional[str] = None,
 ) -> List[str]:
     """Distill recall-friendly investigation notes from the user question + assistant answer.
+    Purposely avoid manual regex rules, arbitrary confidence ratings, etc
 
-    - No manual regex rules.
-    - No confidence ratings.
-    - Guardrail: extracted observables must appear verbatim in provided text.
+    Guardrail: extracted observables must appear verbatim in provided text.
 
     Returns a list of note texts to store in the analysis namespace.
     """
@@ -609,15 +791,16 @@ async def _distill_investigation_memories(
             last_user = (m.content or "").strip()
             break
 
-    source_text = f"USER: {last_user}\nASSISTANT: {assistant_reply}".strip()
-
+    tool_transcript = _build_tool_transcript(messages)
     chosen_model = settings.MEMORY_MODEL_NAME or model_name
     tools_str = ", ".join(tool_names) if tool_names else "none"
+    source_text = f"USER: {last_user}\nASSISTANT: {assistant_reply}".strip()
+    source_text_all = (
+        f"TOOLS USED: {tools_str}\n\n"
+        + source_text
+        + ("\n\nTOOL OUTPUTS:\n" + tool_transcript if tool_transcript else "\n\nTOOL OUTPUTS: (none)")
+    ).strip()
 
-    # Hard caps to keep stored analysis notes compact.
-    MAX_NOTE_CHARS = 1200
-    MAX_OBSERVABLES = 12
-    MAX_TAGS = 8
 
     convo = [
         ChatMessage(
@@ -626,7 +809,14 @@ async def _distill_investigation_memories(
         ),
         ChatMessage(
             role="user",
-            content=(f"TOOLS USED: {tools_str}\n\n{source_text}"),
+            content=(
+                source_text_all
+                + "\n\nOUTPUT REQUIREMENTS:\n"
+                + "- Return ONLY a single JSON object matching the distiller schema.\n"
+                + "- Do NOT include markdown tables; use short bullets or sentences instead.\n"
+                + "- Do NOT embed JSON objects inside string fields; keep fields as plain strings.\n"
+                + "- Avoid literal tab characters; use spaces.\n"
+            ),
         ),
     ]
 
@@ -636,6 +826,7 @@ async def _distill_investigation_memories(
             "model": chosen_model,
             "messages": convo,
             "temperature": 0.0,
+            "response_format": {"type": "json_object"},
             **knobs,
         }
     )
@@ -656,6 +847,7 @@ async def _distill_investigation_memories(
 
     msg = resp["choices"][0]["message"]
     content = (msg.get("content") or "").strip()
+    content = _sanitize_json_control_chars(content)
 
     if not content:
         rc = (msg.get("reasoning_content") or "").strip()
@@ -663,7 +855,17 @@ async def _distill_investigation_memories(
             logger.warning(
                 "Investigation distiller returned empty message.content; attempting JSON parse from reasoning_content fallback."
             )
-            content = rc
+            content = _sanitize_json_control_chars(rc)
+
+    _log_memory(
+        "analysis.raw.preview",
+        user_id=user_id,
+        model=chosen_model,
+        finish_reason=finish_reason,
+        content_len=len(content),
+        preview=_clip_text(content),
+        req_id=req_id,
+    )
 
     if finish_reason == "length":
         _log_memory(
@@ -710,10 +912,40 @@ async def _distill_investigation_memories(
             logger.error(log_msg)
         return []
 
-    store = bool(obj.get("store", False))
-    if not store:
+    memories = obj.get("memories", [])
+    if not isinstance(memories, list):
+        memories = []
+
+    def _as_float(v: Any) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    max_conf = 0.0
+    max_sal = 0.0
+    for _m in memories:
+        if isinstance(_m, dict):
+            max_conf = max(max_conf, _as_float(_m.get("confidence")))
+            max_sal = max(max_sal, _as_float(_m.get("salience")))
+
+    _log_memory(
+        "analysis.raw.parsed",
+        user_id=user_id,
+        model=chosen_model,
+        finish_reason=finish_reason,
+        n_memories=len(memories),
+        max_confidence=max_conf,
+        max_salience=max_sal,
+        keys=list(obj.keys()) if isinstance(obj, dict) else None,
+        req_id=req_id,
+    )
+
+    # Decide whether anything is worth storing based on envelope content + thresholds.
+    # Observables are a strong signal even when confidence/salience is low.
+    if not memories:
         _log_memory(
-            "analysis.skip.store_false",
+            "analysis.skip.no_memories",
             finish_reason=finish_reason,
             user_id=user_id,
             model=chosen_model,
@@ -721,44 +953,130 @@ async def _distill_investigation_memories(
         )
         return []
 
-    memories = obj.get("memories", [])
-    if not isinstance(memories, list):
+    # Extract and normalize envelope memories.
+    parsed: List[Dict[str, Any]] = []
+    total_obs = 0
+
+    for m in memories:
+        if not isinstance(m, dict):
+            continue
+
+        summary = m.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            continue
+
+        details = m.get("details")
+        if not isinstance(details, dict):
+            details = {}
+
+        observables = details.get("observables", [])
+        if not isinstance(observables, list):
+            observables = []
+        observables = [o for o in observables if isinstance(o, str) and o.strip()]
+
+        # Guardrail: keep only verbatim observables, now including tool outputs.
+        observables = _filter_verbatim_observables(observables, source_text_all)
+
+        tags = m.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        tags = [t.strip() for t in tags if isinstance(t, str) and t.strip()][:ANALYSIS_MAX_TAGS]
+
+        conf_v = _as_float(m.get("confidence"))
+        sal_v = _as_float(m.get("salience"))
+
+        tools_used = details.get("tools_used")
+        if not isinstance(tools_used, list):
+            tools_used = None
+        if isinstance(tools_used, list):
+            tools_used = [t.strip() for t in tools_used if isinstance(t, str) and t.strip()]
+
+        parsed.append(
+            {
+                "summary": summary.strip(),
+                "observables": observables,
+                "tags": tags,
+                "confidence": conf_v,
+                "salience": sal_v,
+                "tools_used": tools_used,
+            }
+        )
+        total_obs += len(observables)
+
+    if not parsed:
         _log_memory(
-            "analysis.skip.bad_shape",
+            "analysis.skip.no_parsed_memories",
+            finish_reason=finish_reason,
             user_id=user_id,
             model=chosen_model,
             req_id=req_id,
         )
         return []
 
+    max_conf = max((p["confidence"] for p in parsed), default=0.0)
+    max_sal = max((p["salience"] for p in parsed), default=0.0)
+
+    should_store = bool(parsed) and (
+        total_obs > 0
+        or max_sal >= ANALYSIS_SALIENCE_THRESHOLD
+        or max_conf >= ANALYSIS_CONFIDENCE_THRESHOLD
+    )
+
+    _log_memory(
+        "analysis.store.decision",
+        finish_reason=finish_reason,
+        user_id=user_id,
+        model=chosen_model,
+        n_memories=len(parsed),
+        max_confidence=max_conf,
+        max_salience=max_sal,
+        n_observables=total_obs,
+        store=should_store,
+        req_id=req_id,
+    )
+
+    if not should_store:
+        _log_memory(
+            "analysis.skip.thresholds",
+            finish_reason=finish_reason,
+            user_id=user_id,
+            model=chosen_model,
+            max_confidence=max_conf,
+            max_salience=max_sal,
+            n_observables=total_obs,
+            req_id=req_id,
+        )
+        return []
+
+    # Prefer higher-salience items first.
+    parsed.sort(key=lambda d: (d.get("salience", 0.0), d.get("confidence", 0.0)), reverse=True)
+
     out_texts: List[str] = []
-    for m in memories[:3]:
-        if not isinstance(m, dict):
-            continue
-        text = m.get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
+    for p in parsed[:ANALYSIS_MAX_NOTES]:
+        summary = p["summary"]
+        if len(summary) > ANALYSIS_SUMMARY_CAP:
+            summary = summary[: ANALYSIS_SUMMARY_CAP - 1].rstrip() + "…"
 
-        observables = m.get("observables", [])
-        if not isinstance(observables, list):
-            observables = []
-        observables = _filter_verbatim_observables(observables, source_text)
+        parts: List[str] = [summary]
 
-        tags = m.get("tags", [])
-        if not isinstance(tags, list):
-            tags = []
-        tags = [t.strip() for t in tags if isinstance(t, str) and t.strip()][:MAX_TAGS]
+        tools_used = p.get("tools_used")
+        if isinstance(tools_used, list) and tools_used:
+            parts.append(f"Tools: {', '.join(tools_used)}")
+        elif tool_names:
+            parts.append(f"Tools: {tools_str}")
 
-        parts = [f"Tools: {tools_str}", text.strip()]
+        observables = p.get("observables") or []
         if observables:
-            obs_joined = ", ".join(observables[:MAX_OBSERVABLES])
+            obs_joined = ", ".join(observables[:ANALYSIS_MAX_OBSERVABLES])
             parts.append(f"Observables: {obs_joined}")
+
+        tags = p.get("tags") or []
         if tags:
             parts.append(f"Tags: {', '.join(tags)}")
 
-        note = "\n".join(parts)
-        if len(note) > MAX_NOTE_CHARS:
-            note = note[: MAX_NOTE_CHARS - 1].rstrip() + "…"
+        note = " | ".join(parts).strip()
+        if len(note) > ANALYSIS_MAX_NOTE_CHARS:
+            note = note[: ANALYSIS_MAX_NOTE_CHARS - 1].rstrip() + "…"
 
         out_texts.append(note)
 
@@ -825,7 +1143,58 @@ async def extract_and_store_memory(
 
     # Investigation-note distillation is independent of USER-facts extraction.
     try:
+        # Instrumentation: verify whether the messages passed into memory extraction
+        # actually contain tool messages or assistant tool_calls.
+        role_counts: Dict[str, int] = {}
+        n_tool_role = 0
+        n_tool_call_msgs = 0
+        n_tool_calls_total = 0
+        n_tool_call_id = 0
+
+        for m in messages:
+            r = getattr(m, "role", None) or ""
+            role_counts[r] = role_counts.get(r, 0) + 1
+            if r == "tool":
+                n_tool_role += 1
+
+            tc = getattr(m, "tool_calls", None)
+            if isinstance(tc, list) and tc:
+                n_tool_call_msgs += 1
+                n_tool_calls_total += len(tc)
+
+            tci = getattr(m, "tool_call_id", None)
+            if isinstance(tci, str) and tci:
+                n_tool_call_id += 1
+
+        _log_memory(
+            "analysis.tools.input",
+            user_id=user_id,
+            req_id=req_id,
+            n_msgs=len(messages),
+            role_counts=role_counts,
+            n_tool_role_msgs=n_tool_role,
+            n_tool_call_msgs=n_tool_call_msgs,
+            n_tool_calls_total=n_tool_calls_total,
+            n_tool_call_id=n_tool_call_id,
+        )
+
         tool_names = _collect_tool_names(messages)
+        _log_memory(
+            "analysis.tools.collected",
+            user_id=user_id,
+            req_id=req_id,
+            n_tool_names=len(tool_names),
+            tool_names=tool_names,
+        )
+
+        _log_memory(
+            "analysis.tools.shapes",
+            user_id=user_id,
+            req_id=req_id,
+            assistant_reply_len=len(assistant_reply or ""),
+            shapes=_summarize_message_shapes(messages),
+        )
+
         notes = await _distill_investigation_memories(
             user_id=user_id,
             messages=messages,
@@ -895,6 +1264,7 @@ async def extract_and_store_memory(
             "model": chosen_model,
             "messages": convo,
             "temperature": 0.0,
+            "response_format": {"type": "json_object"},
             **knobs,
         }
     )
@@ -995,26 +1365,26 @@ async def extract_and_store_memory(
                 logger.error(log_msg)
             return stored_any
 
-        conf = float(obj.get("confidence", 0.0) or 0.0)
+        # Parse confidence with presence detection and error handling
+        conf_raw = obj.get("confidence", None)
+        conf_present = conf_raw is not None
+        try:
+            conf = float(conf_raw) if conf_present else 0.0
+        except Exception:
+            conf = 0.0
+            conf_present = False
 
         items = obj.get("items")
-        # Back-compat: tolerate older schema "facts": [string, ...]
-        if items is None:
-            facts = obj.get("facts", [])
-            if not isinstance(facts, list):
-                logger.error(f"Memory extractor 'facts' is not a list: {facts!r}")
-                return stored_any
-            items = [
-                {
-                    "text": f,
-                    "category": "profile",
-                    "evidence": f,
-                }
-                for f in facts
-            ]
-
         if not isinstance(items, list):
-            logger.error(f"Memory extractor 'items' is not a list: {items!r}")
+            _log_memory(
+                "extract.skip.bad_shape",
+                finish_reason=finish_reason,
+                user_id=user_id,
+                model=chosen_model,
+                keys=list(obj.keys()) if isinstance(obj, dict) else None,
+                req_id=req_id,
+            )
+            logger.error(f"Memory extractor 'items' is not a list (hard cutover): {items!r}")
             return stored_any
 
         candidate_items: List[UserMemoryItem] = []
@@ -1061,6 +1431,7 @@ async def extract_and_store_memory(
             user_id=user_id,
             model=chosen_model,
             confidence=conf,
+            confidence_present=conf_present,
             n_items=len(items),
             n_candidates=len(candidate_items),
             kept=kept,
@@ -1074,6 +1445,16 @@ async def extract_and_store_memory(
         )
         return stored_any
 
+    if not candidate_items:
+        _log_memory(
+            "skip.no_facts",
+            user_id=user_id,
+            model=chosen_model,
+            confidence=conf,
+            req_id=req_id,
+        )
+        return stored_any
+
     if conf < settings.MEMORY_MIN_CONFIDENCE:
         _log_memory(
             "skip.low_confidence",
@@ -1081,16 +1462,7 @@ async def extract_and_store_memory(
             model=chosen_model,
             confidence=conf,
             min_confidence=settings.MEMORY_MIN_CONFIDENCE,
-            req_id=req_id,
-        )
-        return stored_any
-
-    if not candidate_items:
-        _log_memory(
-            "skip.no_facts",
-            user_id=user_id,
-            model=chosen_model,
-            confidence=conf,
+            confidence_present=conf_present,
             req_id=req_id,
         )
         return stored_any

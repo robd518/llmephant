@@ -75,6 +75,13 @@ VERIFY_PROMPT: str = _dedent(
 You will be given a USER transcript (USER messages only) and a list of candidate memory items.
 Your job is to return ONLY the items that should be STORED as durable memories.
 
+CRITICAL OUTPUT RULES:
+- You MUST return a strict SUBSET of the provided candidate items.
+- Do NOT create new items.
+- Do NOT rewrite or normalize fields.
+  - For any kept item, copy `text`, `category`, and `evidence` EXACTLY as provided in the candidate list.
+- Preserve order: output items must appear in the same order as the input candidates.
+
 Rules:
 - Only keep items that are explicitly supported by the transcript evidence.
 - Drop instructions/requests/tasks/to-dos, even if rewritten as a statement (e.g., 'User requires a narrative summary...').
@@ -85,6 +92,8 @@ Rules:
 - Evidence MUST be a verbatim substring from the transcript.
 - Return ONLY valid JSON (no markdown, no prose).
 
+If nothing should be stored, return exactly: {"items": []}
+
 JSON format:
 {
   "items": [
@@ -94,37 +103,77 @@ JSON format:
       "evidence": string
     }, ...
   ]
-}"""
+}
+"""
 )
 
 
 # --- Investigation/tool-output distillation prompt -------------------------
 
 DISTILL_PROMPT: str = _dedent(
-    """You are a memory distiller for cybersecurity investigations.
-Given the USER question, the ASSISTANT final answer, and the tool names used, decide whether to store durable investigation notes for future recall.
+    """You are a Memory Compiler for investigation notes.
 
-Constraints:
-- Do NOT store personal profile facts about the user (preferences, identity, habits).
-- Prefer durable investigation takeaways: key findings, hypotheses, procedures, IOCs/observables mentioned.
-- Keep memory texts concise (<= 300 characters each).
-- Include at most 12 observables and 8 tags per memory.
-- If nothing is worth remembering, set store=false and return an empty list.
-- Observables MUST be copied exactly from the provided text (verbatim substrings).
-- If you cannot fit valid JSON, return {"store": false, "memories": []}.
-- Return ONLY valid JSON (no markdown, no prose).
+You will be given the USER question, the ASSISTANT final answer, and tool activity (tool names and any tool outputs).
+Your job is to produce compact, durable investigation memories suitable for future recall.
 
-JSON format:
+OUTPUT (STRICT):
+- Return ONLY a single valid JSON object. No markdown, no code fences, no prose.
+- Output MUST match this JSON shape exactly:
+
 {
-  "store": true|false,
   "memories": [
     {
-      "text": string,
-      "observables": [string, ...],
-      "tags": [string, ...]
-    }, ...
+      "lane": "all",
+      "scope": "user" | "workspace" | "notes" | "global" | "unknown",
+      "kind": "fact" | "preference" | "plan" | "decision" | "definition" | "event" | "note" | "other",
+      "summary": "string",
+      "evidence": "string" | null,
+      "tags": ["string", "..."],
+      "details": {"any": "json"},
+      "confidence": 0.0,
+      "salience": 0.0
+    }
   ]
-}"""
+}
+
+RULES:
+- This compiler is for INVESTIGATION NOTES ONLY (analysis/tool distillation).
+- Do NOT store personal profile facts about the user (name, identity, bio, preferences).
+- Do NOT store tasks/to-dos/instructions.
+- "lane" MUST always be "all" for investigation memories.
+- For investigation memories, set:
+  - scope = "notes"
+  - kind = "note" (or "event" if it is a concrete observed event)
+- "summary" must be concise and retrieval-friendly:
+  - 800 characters max.
+  - Single-line only: do NOT include newline/tab characters and do NOT include markdown tables.
+  - Use short sentences separated by semicolons if needed.
+
+OBSERVABLES (IMPORTANT):
+- If any observables appear verbatim in the provided input (USER question, ASSISTANT answer, tool names/outputs), collect them.
+- Observables include: domains, URLs, IPs, file names, process/service names, registry keys, email addresses, hashes (MD5/SHA1/SHA256), and user/host identifiers.
+- Do NOT invent observables. Only include strings that appear verbatim in the provided input.
+- Put observables in details.observables as a JSON array of strings.
+- Limit details.observables to at most 20 items.
+- If details.observables is present and non-empty, the summary MUST mention at least one of the highest-salience observables (e.g., the domain or hash).
+- If no observables are present in the input, omit details.observables.
+
+- "tags" is optional but recommended (0-8 tags). Keep tags short.
+- "details" is optional but recommended when helpful. Use it for structured extras such as:
+  - {"tools_used": ["tool_a", "tool_b"], "observables": ["..."], "hosts": ["..."], "files": ["..."], "campaign": "..."}
+  - Do NOT invent tool calls, observables, or other entities.
+  - Only include tool names/observables that appear in the provided input.
+  - HARD RULE: If the provided input includes a non-empty list of tool names, you MUST set details.tools_used to exactly that list (same tool names, same order). If details is omitted, create it.
+  - HARD RULE: If the provided input indicates zero tool names, do NOT include tools_used in details.
+- "evidence": always null for investigation memories.
+- "confidence" and "salience" are numbers 0..1.
+- Create at most 6 memories. Prefer fewer, higher-signal items.
+- If nothing is worth remembering, return exactly: {"memories": []}
+
+Examples (valid minimal):
+- {"memories": []}
+- {"memories": [{"lane":"all","scope":"notes","kind":"note","summary":"Observed domain example.org associated with phishing; recommend blocking; monitor similar SMTP anomalies.","evidence":null,"tags":["phishing"],"details":{"observables":["example.org"],"tools_used":["ti_lookup"]},"confidence":0.7,"salience":0.6}]}
+"""
 )
 
 
