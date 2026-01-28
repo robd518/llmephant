@@ -42,8 +42,9 @@ Rules:
 - Profile is extremely strict: only durable facts likely true in 30+ days (identity/role/preferences explicitly stated).
 - If a fact is situational (testing, this run, right now), classify as workspace or drop it.
 - Write items in third person, as declarative statements (not commands).
-- Keep items short (<= 140 chars each).
+- Keep items short (<= 300 chars each).
 - Evidence MUST be a verbatim substring from USER transcript.
+- If nothing should be stored, return exactly: {"items": []}
 - Respond ONLY as valid JSON (no markdown, no prose).
 
 Examples (DO NOT STORE):

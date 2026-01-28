@@ -99,14 +99,16 @@ def test_filter_verbatim_observables_keeps_only_present(memory_service):
     assert "missing.example" not in out
 
 
-def test_analysis_distill_is_hard_cutover_no_store_gate(memory_service):
-    """Regression guard: distillation must not rely on legacy `store` gates."""
+def test_build_user_transcript_only_user_messages(memory_service):
+    build = getattr(memory_service, "_build_user_transcript")
 
-    fn = getattr(memory_service, "_distill_investigation_memories")
-    src = inspect.getsource(fn)
+    msgs = [
+        _msg("user", "First"),
+        _msg("assistant", "Ignore this"),
+        _msg("user", "Second"),
+    ]
 
-    assert 'obj.get("store"' not in src
-    assert "analysis.skip.store_false" not in src
+    assert build(msgs) == "First\nSecond"
 
 
 def test_extractor_is_hard_cutover_no_facts_backcompat(memory_service):
@@ -119,43 +121,37 @@ def test_extractor_is_hard_cutover_no_facts_backcompat(memory_service):
     assert "Back-compat" not in src
 
 
-def test_analysis_tuning_constants_are_module_level(memory_service):
+def test_memory_tuning_constants_are_module_level(memory_service):
     """Ensure the main tuning knobs remain easy to find/edit."""
 
     for name in (
-        "ANALYSIS_SALIENCE_THRESHOLD",
-        "ANALYSIS_CONFIDENCE_THRESHOLD",
-        "ANALYSIS_MAX_NOTE_CHARS",
-        "ANALYSIS_SUMMARY_CAP",
-        "ANALYSIS_MAX_OBSERVABLES",
-        "ANALYSIS_MAX_TAGS",
-        "ANALYSIS_MAX_NOTES",
+        "MEMORY_MAX_NOTE_CHARS",
+        "MEMORY_SUMMARY_CAP",
+        "MEMORY_MAX_NOTES",
+        "MEMORY_MAX_TAGS",
+        "MEMORY_MAX_OBSERVABLES",
     ):
         assert hasattr(memory_service, name), f"Missing tuning constant: {name}"
 
 
 @pytest.mark.asyncio
-async def test_distill_parser_accepts_envelope_shape_smoke(monkeypatch, memory_service):
-    """Smoke test of the envelope distillation parsing path.
+async def test_extract_parser_filters_by_evidence(monkeypatch, memory_service):
+    """Smoke test of extraction + evidence gating."""
 
-    service.py calls the module-level `chat_upstream(...)` directly, so we patch that.
-    """
+    fn = getattr(memory_service, "_distill_memories")
 
-    fn = getattr(memory_service, "_distill_investigation_memories")
-
-    distill_obj = {
-        "memories": [
+    extract_obj = {
+        "items": [
             {
-                "lane": "all",
-                "scope": "notes",
-                "kind": "note",
-                "summary": "Observed domain example.org; recommended block; IR follow-up.",
-                "evidence": None,
-                "tags": ["phishing"],
-                "details": {"observables": ["example.org"], "tools_used": ["tool_a"]},
-                "confidence": 0.9,
-                "salience": 0.8,
-            }
+                "text": "User prefers Python for side projects.",
+                "category": "profile",
+                "evidence": "I prefer Python",
+            },
+            {
+                "text": "User prefers Rust.",
+                "category": "profile",
+                "evidence": "I prefer Rust",
+            },
         ]
     }
 
@@ -164,7 +160,7 @@ async def test_distill_parser_accepts_envelope_shape_smoke(monkeypatch, memory_s
         return {
             "choices": [
                 {
-                    "message": {"content": json.dumps(distill_obj)},
+                    "message": {"content": json.dumps(extract_obj)},
                     "finish_reason": "stop",
                 }
             ]
@@ -173,9 +169,8 @@ async def test_distill_parser_accepts_envelope_shape_smoke(monkeypatch, memory_s
     monkeypatch.setattr(memory_service, "chat_upstream", _fake_chat_upstream)
 
     msgs = [
-        _msg("user", "Investigate something"),
-        _msg("assistant", "Sure"),
-        _msg("tool", "example.org", name="tool_a"),
+        _msg("user", "I prefer Python for side projects."),
+        _msg("assistant", "Got it."),
     ]
 
     out = await fn(
@@ -183,10 +178,17 @@ async def test_distill_parser_accepts_envelope_shape_smoke(monkeypatch, memory_s
         messages=msgs,
         assistant_reply="assistant final",
         model_name="dummy",
-        tool_names=["tool_a"],
         req_id="req",
     )
 
     assert isinstance(out, list)
-    assert out, "Expected at least one distilled note"
-    assert "example.org" in out[0]
+    assert out == [
+        {"text": "User prefers Python for side projects.", "category": "profile"}
+    ]
+
+
+def test_evidence_in_source_normalizes_case_and_whitespace(memory_service):
+    fn = getattr(memory_service, "_evidence_in_source")
+
+    assert fn("I prefer Python", "I prefer   python for side projects.") is True
+    assert fn("I prefer Rust", "I prefer Python for side projects.") is False

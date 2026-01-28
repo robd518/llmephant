@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     MEMORY_MIN_CONFIDENCE: float
     MEMORY_SIMILARITY_THRESHOLD: float
+    # Near-duplicate threshold for semantic dedupe (stricter than retrieval).
+    MEMORY_DEDUPE_THRESHOLD: float = 0.95
     MEMORY_TTL_DAYS: int
     ENABLE_MEMORY_EXTRACTION: str
     DEFAULT_USER_ID: str

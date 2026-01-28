@@ -7,14 +7,10 @@ from llmephant.models.chat_model import ChatRequest, ErrorMessage, ChatErrorMess
 from llmephant.models.chat_model import ChatMessage
 from llmephant.tools.executor import ToolResult
 from llmephant.services.memory import (
-    augment_messages_with_analysis_memories,
     augment_messages_with_memory,
-    augment_messages_with_workspace_memories,
     extract_and_store_memory,
     handle_explicit_remember_request,
-    search_relevant_analysis_memories,
     search_relevant_memories,
-    search_relevant_workspace_memories,
 )
 from llmephant.services.upstream_llm import chat_upstream, chat_upstream_stream
 from llmephant.utils.text import get_last_user_message
@@ -107,33 +103,33 @@ def _apply_memory_context(
 ) -> List[ChatMessage]:
     """Inject memory context for the turn.
 
-    We keep three namespaces:
-      - user facts ("VERIFIED FACTS about the USER")
-      - current work context ("CURRENT WORK CONTEXT")
-      - investigation notes ("PRIOR INVESTIGATION NOTES")
-
+    Hard cutover: a single memory bucket keyed by `user_id`.
     Sidecar prompts should bypass this entirely.
     """
     handle_explicit_remember_request(user_id, last_msg)
 
-    user_memories = search_relevant_memories(user_id, last_msg)
-    workspace_memories = search_relevant_workspace_memories(user_id, last_msg)
-    analysis_memories = search_relevant_analysis_memories(user_id, last_msg)
+    memories = search_relevant_memories(user_id, last_msg)
 
     logger.info(
-        f"memory.inject user_id={user_id} user_memories={len(user_memories)} "
-        f"workspace_memories={len(workspace_memories)} analysis_memories={len(analysis_memories)}"
+        f"memory.inject user_id={user_id} memories={len(memories)}"
     )
 
-    # Apply in a stable order.
-    # - Investigation notes and workspace context are advisory.
-    # - User facts are higher-priority.
-    out = augment_messages_with_analysis_memories(messages, analysis_memories)
-    out = augment_messages_with_workspace_memories(out, workspace_memories)
-    out = augment_messages_with_memory(out, user_memories)
+    out = augment_messages_with_memory(messages, memories)
+
+    # Tool hygiene: if we can answer from memories, do not call tools.
+    # We only add this hint when we actually injected memories.
+    if memories:
+        out = out + [
+            ChatMessage(
+                role="system",
+                content=(
+                    "If you can answer the user's question using the provided memories, do not call tools. "
+                    "Only call tools if the memories are insufficient."
+                ),
+            )
+        ]
+
     return out
-
-
 
 def _accumulate_tool_call_deltas(
     acc: Dict[int, Dict[str, Any]],
@@ -393,7 +389,7 @@ async def run_chat_runtime_stream(
                     if not saw_tool_calls:
                         indices = [int(t.get("index", 0)) for t in (tc_deltas or [])]
                         logger.info(
-                            f"[tool-stream] detected tool_call deltas (iteration={iteration}) indices={indices} count={len(tc_deltas)}"
+                            f"[tool-stream] detected tool_call deltas req_id={req_id} (iteration={iteration}) indices={indices} count={len(tc_deltas)}"
                         )
                     saw_tool_calls = True
                     _accumulate_tool_call_deltas(tool_calls_acc, tc_deltas)
@@ -428,7 +424,7 @@ async def run_chat_runtime_stream(
             tool_calls_raw = [tool_calls_acc[i] for i in sorted(tool_calls_acc.keys())]
 
             logger.info(
-                f"[tool-stream] assembled tool_calls (iteration={iteration}): {_summarize_tool_calls(tool_calls_raw)}"
+                f"[tool-stream] assembled tool_calls req_id={req_id} (iteration={iteration}): {_summarize_tool_calls(tool_calls_raw)}"
             )
 
             _ensure_tool_call_ids(tool_calls_raw, prefix=f"call_{iteration}")
@@ -449,7 +445,7 @@ async def run_chat_runtime_stream(
                 args_str = fn.get("arguments") or "{}"
 
                 logger.info(
-                    f"[tool-stream] executing tool (iteration={iteration}) name={name} call_id={call_id} args_len={len(args_str) if isinstance(args_str, str) else 'n/a'}"
+                    f"[tool-stream] executing tool req_id={req_id} (iteration={iteration}) name={name} call_id={call_id} args_len={len(args_str) if isinstance(args_str, str) else 'n/a'}"
                 )
 
                 try:
@@ -460,7 +456,7 @@ async def run_chat_runtime_stream(
                     )
                 except Exception as e:
                     logger.warning(
-                        f"[tool-stream] failed to parse tool args as JSON (iteration={iteration}) name={name} call_id={call_id}: {e}"
+                        f"[tool-stream] failed to parse tool args as JSON req_id={req_id} (iteration={iteration}) name={name} call_id={call_id}: {e}"
                     )
                     args = {}
 
@@ -468,14 +464,14 @@ async def run_chat_runtime_stream(
                     tool_result = await executor.execute(name, args)
                 except Exception as e:
                     logger.exception(
-                        f"[tool-stream] tool execution raised (iteration={iteration}) name={name} call_id={call_id}"
+                        f"[tool-stream] tool execution raised req_id={req_id} (iteration={iteration}) name={name} call_id={call_id}"
                     )
                     tool_result = ToolResult(
                         result=None, is_error=True, error=str(e), raw=None
                     )
 
                 logger.info(
-                    f"[tool-stream] tool complete (iteration={iteration}) name={name} call_id={call_id} is_error={tool_result.is_error} result_type={type(tool_result.result).__name__}"
+                    f"[tool-stream] tool complete req_id={req_id} (iteration={iteration}) name={name} call_id={call_id} is_error={tool_result.is_error} result_type={type(tool_result.result).__name__}"
                 )
 
                 content = _tool_result_to_content(tool_result)
@@ -658,7 +654,9 @@ async def run_chat_runtime(
 
         # If the model requested tools, execute them and continue the loop.
         if tool_calls_raw:
-            logger.info(f"Tool calls requested: {_summarize_tool_calls(tool_calls_raw)}")
+            logger.info(
+                f"Tool calls requested req_id={req_id}: {_summarize_tool_calls(tool_calls_raw)}"
+            )
             _ensure_tool_call_ids(tool_calls_raw, prefix=f"call_{iteration}")
             if iteration > max_tool_iterations:
                 err = ChatErrorMessage(
@@ -688,6 +686,10 @@ async def run_chat_runtime(
                 name = fn.get("name")
                 args_str = fn.get("arguments") or "{}"
 
+                logger.info(
+                    f"[tool] executing req_id={req_id} (iteration={iteration}) name={name} call_id={call_id} args_len={len(args_str) if isinstance(args_str, str) else 'n/a'}"
+                )
+
                 try:
                     args = (
                         json.loads(args_str)
@@ -701,7 +703,7 @@ async def run_chat_runtime(
                     tool_result = await executor.execute(name, args)
                 except Exception as e:
                     logger.exception(
-                        f"Tool execution raised name={name} call_id={call_id}"
+                        f"Tool execution raised req_id={req_id} name={name} call_id={call_id}"
                     )
                     tool_result = ToolResult(
                         result=None, is_error=True, error=str(e), raw=None
@@ -709,6 +711,10 @@ async def run_chat_runtime(
 
                 # Append tool message for the model to consume
                 content = _tool_result_to_content(tool_result)
+
+                logger.info(
+                    f"[tool] complete req_id={req_id} (iteration={iteration}) name={name} call_id={call_id} is_error={tool_result.is_error} result_type={type(tool_result.result).__name__}"
+                )
 
                 req.messages.append(
                     ChatMessage(

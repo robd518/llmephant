@@ -21,29 +21,38 @@ def init_qdrant():
         )
 
 
-def qdrant_search(user_id, query_vec, top_k):
+def qdrant_search(user_id, query_vec, top_k, *, category: str | None = None):
+    must = [{"key": "user_id", "match": {"value": user_id}}]
+    if category:
+        must.append({"key": "category", "match": {"value": category}})
     results = client.query_points(
         collection_name=settings.QDRANT_COLLECTION,
         query=query_vec,
         limit=top_k,
         with_payload=True,
-        query_filter={"must": [{"key": "user_id", "match": {"value": user_id}}]},
+        query_filter={"must": must},
     )
     return [
         {
             "text": p.payload.get("text", ""),
             "score": p.score,
             "created_at": p.payload.get("created_at"),
+            "category": p.payload.get("category"),
         }
         for p in results.points
     ]
 
 
-def qdrant_upsert(user_id, texts, vectors):
+def qdrant_upsert(user_id, texts, vectors, *, categories=None):
     now = datetime.datetime.utcnow().isoformat() + "Z"
     expiry = (
         datetime.datetime.utcnow() + datetime.timedelta(days=settings.MEMORY_TTL_DAYS)
     ).isoformat() + "Z"
+
+    if categories is None:
+        categories = [None] * len(texts)
+    if len(categories) != len(texts):
+        raise ValueError("categories length must match texts length")
 
     points = [
         PointStruct(
@@ -54,9 +63,10 @@ def qdrant_upsert(user_id, texts, vectors):
                 "text": text,
                 "created_at": now,
                 "expires_at": expiry,
+                **({"category": category} if category else {}),
             },
         )
-        for text, vec in zip(texts, vectors)
+        for text, vec, category in zip(texts, vectors, categories)
     ]
 
     client.upsert(collection_name=settings.QDRANT_COLLECTION, points=points, wait=True)
