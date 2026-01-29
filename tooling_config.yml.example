@@ -1,0 +1,129 @@
+
+
+# llmephant tooling configuration
+#
+# This file defines which tool providers (currently: MCP over HTTP) should be
+# loaded at app startup. The app reads this file from the path specified by
+# the TOOLING_CONFIG_FILE environment variable (specified in the .env file):
+#
+#   TOOLING_CONFIG_FILE=/absolute/path/to/tooling_config.yml
+#
+# Notes:
+# - You can keep this file next to your `.env` for convenience.
+# - In Docker, mount the file into the container and set TOOLING_CONFIG_FILE
+#   to the in-container path (e.g. /app/tooling_config.yml).
+# - You may use environment-variable expansion in values (e.g. "${TOKEN}").
+# - Do NOT put secrets directly in this file. Prefer `${ENV_VAR}`.
+#
+# Minimal shape:
+#   tooling:
+#     enabled: true
+#     mcp_servers: []
+
+
+tooling:
+  # Master switch for all tooling. If false, the app will not attempt to load
+  # MCP servers and will run in chat-only mode.
+  enabled: true
+
+  # List of MCP servers to load. THESE ARE EXAMPLES ONLY!
+  # Each server is namespaced by `tool_name_prefix` so tools cannot collide.
+  mcp_servers:
+
+    # -----------------------------------------------------------------------
+    # Example 1: No-auth MCP server
+    # -----------------------------------------------------------------------
+    - name: "MCP No Auth"
+      enabled: true
+
+      # Base URL of the MCP server endpoint.
+      # Example: http://127.0.0.1:8001/mcp
+      url: "http://127.0.0.1:8001/mcp"
+
+      # Prefix applied to every imported tool name.
+      # If the server exposes a tool named `echo`, it becomes `mcp_noauth__echo`.
+      tool_name_prefix: "mcp_noauth__"
+
+      # Optional request timeout (seconds) for this server.
+      timeout_s: 30
+
+
+    # -----------------------------------------------------------------------
+    # Example 2: Bearer token auth via headers
+    # -----------------------------------------------------------------------
+    - name: "MCP Bearer"
+      enabled: true
+      url: "http://127.0.0.1:8002/mcp"
+      tool_name_prefix: "mcp_bearer__"
+      timeout_s: 30
+
+      # Optional HTTP headers. Values can use ${ENV_VAR} expansion.
+      # Put the actual secret in your .env (or container environment).
+      headers:
+        Authorization: "Bearer ${MCP_BEARER_TOKEN}"
+
+
+    # -----------------------------------------------------------------------
+    # Example 3: API key auth via custom header
+    # -----------------------------------------------------------------------
+    - name: "MCP API Key"
+      enabled: false
+      url: "http://127.0.0.1:8003/mcp"
+      tool_name_prefix: "mcp_apikey__"
+      headers:
+        X-API-Key: "${MCP_API_KEY}"
+
+
+    # -----------------------------------------------------------------------
+    # Example 4: Limit which tools are imported (allow list)
+    # -----------------------------------------------------------------------
+    - name: "MCP Allow List"
+      enabled: false
+      url: "http://127.0.0.1:8004/mcp"
+      tool_name_prefix: "mcp_allow__"
+
+      # Only tools with these raw MCP names will be imported.
+      # IMPORTANT: These are the server's tool names BEFORE prefixing.
+      allow_tools:
+        - "echo"
+        - "multiply"
+
+
+    # -----------------------------------------------------------------------
+    # Example 5: Block specific tools (deny list)
+    # -----------------------------------------------------------------------
+    - name: "MCP Deny List"
+      enabled: false
+      url: "http://127.0.0.1:8005/mcp"
+      tool_name_prefix: "mcp_deny__"
+      deny_tools:
+        - "delete_everything"
+        - "shell"
+        - "send_rob_bitcoin"
+
+
+# ---------------------------------------------------------------------------
+# Troubleshooting
+# ---------------------------------------------------------------------------
+# 1) "Tooling config file not found"
+#    - Ensure TOOLING_CONFIG_FILE points to the correct path.
+#    - In Docker, mount the file into the container.
+#
+# 2) "tools enabled but no tools show up"
+#    - Ensure `tooling.enabled: true`.
+#    - Ensure each server has `enabled: true`.
+#    - Check the app logs for per-server initialization errors.
+#
+# 3) Auth issues
+#    - Confirm the environment variable is set inside the running process.
+#    - Prefer `Authorization: "Bearer ${TOKEN}"` style headers.
+#
+# 4) Tool name collisions
+#    - Use unique `tool_name_prefix` values per server.
+#
+# 5) Docker example
+#    - Mount the config:
+#        ./tooling_config.yml:/app/tooling_config.yml:ro
+#    - Set env:
+#        TOOLING_CONFIG_FILE=/app/tooling_config.yml
+#

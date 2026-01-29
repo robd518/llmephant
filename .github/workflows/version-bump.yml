@@ -1,0 +1,99 @@
+name: Version bump
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: "!contains(github.event.head_commit.message, 'ci: bump version')"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine bump
+        id: bump
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          if [[ "$ref" == major/* || "$ref" == breaking/* ]]; then
+            echo "bump=major" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" == minor/* || "$ref" == feature/* ]]; then
+            echo "bump=minor" >> "$GITHUB_OUTPUT"
+          elif [[ "$ref" == patch/* || "$ref" == bugfix/* || "$ref" == fix/* ]]; then
+            echo "bump=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: No bump prefix
+        if: steps.bump.outputs.bump == ''
+        run: echo "No version bump prefix found; skipping."
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.bump.outputs.bump != ''
+
+      - name: Install dependencies
+        if: steps.bump.outputs.bump != ''
+        run: uv sync --group dev
+
+      - name: Run tests
+        if: steps.bump.outputs.bump != ''
+        run: uv run pytest
+
+      - name: Bump version
+        if: steps.bump.outputs.bump != ''
+        id: version
+        env:
+          BUMP: ${{ steps.bump.outputs.bump }}
+        run: |
+          new_version=$(python - <<'PY'
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          bump = os.environ["BUMP"]
+          path = Path("pyproject.toml")
+          data = tomllib.loads(path.read_text())
+          version = data["project"]["version"]
+          major, minor, patch = map(int, version.split("."))
+
+          if bump == "major":
+              major += 1
+              minor = 0
+              patch = 0
+          elif bump == "minor":
+              minor += 1
+              patch = 0
+          elif bump == "patch":
+              patch += 1
+
+          new_version = f"{major}.{minor}.{patch}"
+          text = path.read_text()
+          new_text = re.sub(r'(?m)^version\s*=\s*"\d+\.\d+\.\d+"', f'version = "{new_version}"', text)
+          if text == new_text:
+              raise SystemExit("version line not found")
+          path.write_text(new_text)
+          print(new_version)
+          PY
+          )
+          echo "version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push
+        if: steps.bump.outputs.bump != ''
+        run: |
+          if git diff --quiet; then
+            echo "No version change; skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "ci: bump version to ${{ steps.version.outputs.version }} [skip ci]"
+          git push
