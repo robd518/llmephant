@@ -38,6 +38,7 @@ Rules:
 - Only include facts explicitly supported by the USER transcript (no inference).
 - NEVER store instructions, requests, tasks, or to-do items.
   - If the user is telling the assistant to DO something, that is not a memory.
+- NEVER store user intent framed as a task request (e.g., "User wants to know/asked about...").
 - NEVER store 'how to respond' preferences unless the user states it as a durable preference (e.g., 'I prefer X in general').
 - Profile is extremely strict: only durable facts likely true in 30+ days (identity/role/preferences explicitly stated).
 - If a fact is situational (testing, this run, right now), classify as workspace or drop it.
@@ -51,6 +52,7 @@ Examples (DO NOT STORE):
 - "Re-run the last tool" (task)
 - "Generate a narrative summary" (task)
 - "Redo that last analysis but..." (task)
+- "User wants to know what is on the IGN homepage." (request/intent)
 
 Examples (OK to store as workspace):
 - "User is testing a memory service locally in an isolated environment."
