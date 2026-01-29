@@ -440,8 +440,6 @@ async def test_tools_disabled_omits_tools_and_tool_choice_non_streaming(monkeypa
     monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
     monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)
     monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_workspace_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_analysis_memories", lambda _user_id, _query: [])
 
     request = _make_request_with_state(
         registry=_StubRegistry(tools=[{"type": "function", "function": {"name": "x"}}]),
@@ -476,8 +474,6 @@ async def test_tools_disabled_omits_tools_and_tool_choice_streaming(monkeypatch)
     monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
     monkeypatch.setattr(mod, "chat_upstream_stream", fake_chat_upstream_stream)
     monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_workspace_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_analysis_memories", lambda _user_id, _query: [])
 
     request = _make_request_with_state(
         registry=_StubRegistry(tools=[{"type": "function", "function": {"name": "x"}}]),
@@ -513,8 +509,6 @@ async def test_tools_enabled_but_empty_list_omits_tools_and_tool_choice(monkeypa
     monkeypatch.setattr(mod, "ChatRequest", CapturingChatRequest)
     monkeypatch.setattr(mod, "chat_upstream", fake_chat_upstream)
     monkeypatch.setattr(mod, "search_relevant_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_workspace_memories", lambda _user_id, _query: [])
-    monkeypatch.setattr(mod, "search_relevant_analysis_memories", lambda _user_id, _query: [])
 
     request = _make_request_with_state(
         registry=_StubRegistry(tools=[]),
