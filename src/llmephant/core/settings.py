@@ -3,16 +3,16 @@ from typing import Optional
 
 
 class Settings(BaseSettings):
-    API_HOST: str
-    API_PORT: str
-    API_HOT_RELOAD: str
-    TOOLING_CONFIG_FILE: str
-    UPSTREAM_OPENAI_BASE: str
-    UPSTREAM_OPENAI_API_KEY: str
-    QDRANT_URL: str
-    QDRANT_COLLECTION: str
-    EMBEDDING_MODEL_NAME: str
-    MEMORY_MODEL_NAME: str
+    API_HOST: str = "0.0.0.0"
+    API_PORT: str = "8080"
+    API_HOT_RELOAD: str = "false"
+    TOOLING_CONFIG_FILE: str = "tooling_config.yml"
+    UPSTREAM_OPENAI_BASE: str = "http://localhost:11434"
+    UPSTREAM_OPENAI_API_KEY: str = "local"
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_COLLECTION: str = "llmephant"
+    EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+    MEMORY_MODEL_NAME: str = "qwen2.5:14b-instruct"
 
     # Memory extraction tuning knobs (optional; safe defaults)
     MEMORY_EXTRACT_MAX_TOKENS: Optional[int] = None
@@ -23,13 +23,13 @@ class Settings(BaseSettings):
     # Examples: "none", "low", "medium", "high". Leave unset to avoid backend-specific coupling.
     MEMORY_REASONING_EFFORT: Optional[str] = None
 
-    MEMORY_MIN_CONFIDENCE: float
-    MEMORY_SIMILARITY_THRESHOLD: float
+    MEMORY_MIN_CONFIDENCE: float = 0.9
+    MEMORY_SIMILARITY_THRESHOLD: float = 0.55
     # Near-duplicate threshold for semantic dedupe (stricter than retrieval).
     MEMORY_DEDUPE_THRESHOLD: float = 0.95
-    MEMORY_TTL_DAYS: int
-    ENABLE_MEMORY_EXTRACTION: str
-    DEFAULT_USER_ID: str
+    MEMORY_TTL_DAYS: int = 365
+    ENABLE_MEMORY_EXTRACTION: str = "true"
+    DEFAULT_USER_ID: str = "local-user"
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
