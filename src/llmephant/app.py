@@ -39,7 +39,9 @@ async def lifespan(app: FastAPI):
         tools_imported = 0
 
         try:
-            cfg = load_tooling_config(settings.TOOLING_CONFIG_FILE)
+            # Always read tooling config from the container path.
+            # Bind-mount the host file to /app/tooling_config.yml.
+            cfg = load_tooling_config("/app/tooling_config.yml")
             logger.info("Tooling config loaded: %s", tooling_snapshot(cfg))
 
             if not cfg.enabled:

@@ -6,7 +6,6 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: str = "8080"
     API_HOT_RELOAD: str = "false"
-    TOOLING_CONFIG_FILE: str = "tooling_config.yml"
     UPSTREAM_OPENAI_BASE: str = "http://localhost:11434"
     UPSTREAM_OPENAI_API_KEY: str = "local"
     QDRANT_URL: str = "http://localhost:6333"
