@@ -67,7 +67,7 @@ services:
     command: [ "uvicorn", "llmephant.app:app", "--host", "0.0.0.0", "--port", "8080", "--reload" ]
     volumes:
       - ./src:/app/src
-      - ./tooling_config.yml:/app/tooling_config.yml:ro
+      - llmephant_memory-api/tooling_config.yml:/app/tooling_config.yml:ro
     environment:
       API_HOST: ${API_HOST}
       API_PORT: ${API_PORT}
@@ -104,4 +104,6 @@ volumes:
   llmephant_qdrant:
     external: true
   llmephant_openwebui:
+    external: true
+  llmephant_memory-api:
     external: true
