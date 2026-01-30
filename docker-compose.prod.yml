@@ -34,8 +34,8 @@ services:
       dockerfile: Dockerfile.api
     pull_policy: build
     ports:
-      - "100.97.183.107:8080:8080"
-      - "127.0.0.1:8080:8080"
+      - "100.97.183.107:3001:8080"
+      - "127.0.0.1:3001:8080"
     networks:
       - dev_lab
     restart: unless-stopped
