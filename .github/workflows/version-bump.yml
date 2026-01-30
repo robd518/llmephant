@@ -2,7 +2,7 @@ name: Version bump
 
 on:
   push:
-    branches-ignore:
+    branches:
       - main
 
 permissions:
@@ -20,12 +20,14 @@ jobs:
       - name: Determine bump
         id: bump
         run: |
-          ref="${GITHUB_REF_NAME}"
-          if [[ "$ref" == major/* || "$ref" == breaking/* ]]; then
+          # On main, infer bump from the latest merge commit's source branch name.
+          # Expected merge commit message: "Merge pull request #123 from org/feature/xyz"
+          merge_line=$(git log -1 --pretty=%B | tr '\n' ' ')
+          if [[ "$merge_line" =~ from[[:space:]]+[^/]+/(major|breaking)/ ]]; then
             echo "bump=major" >> "$GITHUB_OUTPUT"
-          elif [[ "$ref" == minor/* || "$ref" == feature/* ]]; then
+          elif [[ "$merge_line" =~ from[[:space:]]+[^/]+/(minor|feature)/ ]]; then
             echo "bump=minor" >> "$GITHUB_OUTPUT"
-          elif [[ "$ref" == patch/* || "$ref" == bugfix/* || "$ref" == fix/* ]]; then
+          elif [[ "$merge_line" =~ from[[:space:]]+[^/]+/(patch|bugfix|fix)/ ]]; then
             echo "bump=patch" >> "$GITHUB_OUTPUT"
           else
             echo "bump=" >> "$GITHUB_OUTPUT"
