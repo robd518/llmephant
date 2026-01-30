@@ -1,1 +1,62 @@
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    ports:
+      - "100.97.183.107:3000:8080"
+      - "127.0.0.1:3000:8080"
+    networks:
+      - dev_lab
+    restart: unless-stopped
+    volumes:
+      - llmephant_openwebui:/app/backend/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.openwebui.rule=Host(`openwebui.trashcollector.dev`)"
+      - "traefik.http.routers.openwebui.entrypoints=https"
+      - "traefik.http.routers.openwebui.tls.certresolver=letsencrypt"
 
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "100.97.183.107:6333:6333"
+      - "127.0.0.1:6333:6333"
+    networks:
+      - dev_lab
+    volumes:
+      - llmephant_qdrant:/qdrant/storage
+
+  memory-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    pull_policy: build
+    ports:
+      - "100.97.183.107:8080:8080"
+      - "127.0.0.1:8080:8080"
+    networks:
+      - dev_lab
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    command: [ "uvicorn", "llmephant.app:app", "--host", "0.0.0.0", "--port", "8080", "--reload" ]
+    volumes:
+      - ./src:/app/src
+      - ./tooling_config.yml:/app/tooling_config.yml:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.memory-api.rule=Host(`memory-api.trashcollector.dev`)"
+      - "traefik.http.routers.memory-api.entrypoints=https"
+      - "traefik.http.routers.memory-api.tls.certresolver=letsencrypt"
+
+networks:
+  dev_lab:
+    external: true
+
+volumes:
+  llmephant_qdrant:
+    external: true
+  llmephant_openwebui:
+    external: true
