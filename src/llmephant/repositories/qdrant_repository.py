@@ -13,7 +13,7 @@ def init_qdrant():
 
     existing = client.get_collections()
     if settings.QDRANT_COLLECTION not in {c.name for c in existing.collections}:
-        from services.embedding_service import vector_dim
+        from llmephant.services.embedding_service import vector_dim
 
         client.create_collection(
             collection_name=settings.QDRANT_COLLECTION,
