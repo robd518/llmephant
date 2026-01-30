@@ -12,7 +12,7 @@ services:
       - llmephant_openwebui:/app/backend/data
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.openwebui.rule=Host(`openwebui.trashcollector.dev`)"
+      - "traefik.http.routers.openwebui.rule=Host(`llmephant.trashcollector.dev`)"
       - "traefik.http.routers.openwebui.entrypoints=https"
       - "traefik.http.routers.openwebui.tls.certresolver=letsencrypt"
 
@@ -47,7 +47,7 @@ services:
       - ./tooling_config.yml:/app/tooling_config.yml:ro
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.memory-api.rule=Host(`memory-api.trashcollector.dev`)"
+      - "traefik.http.routers.memory-api.rule=Host(`llmephant-api.trashcollector.dev`)"
       - "traefik.http.routers.memory-api.entrypoints=https"
       - "traefik.http.routers.memory-api.tls.certresolver=letsencrypt"
 
